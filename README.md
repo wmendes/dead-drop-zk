@@ -84,6 +84,28 @@ bun run publish my-game --build       # Export + build production frontend
 - Dev wallets are generated during `bun run setup` and stored in the root `.env`.
 - Production builds read runtime config from `public/game-studio-config.js`.
 
+Interface for game hub:
+```
+#[contractclient(name = "GameHubClient")]
+pub trait GameHub {
+    fn start_game(
+        env: Env,
+        game_id: Address,
+        session_id: u32,
+        player1: Address,
+        player2: Address,
+        player1_points: i128,
+        player2_points: i128,
+    );
+
+    fn end_game(
+      env: Env,
+      session_id: u32,
+      player1_won: bool
+    );
+}
+```
+
 ## Studio Reference
 
 Run the studio frontend locally (from `sgs_frontend/`):
@@ -95,3 +117,20 @@ Build docs into `docs/`:
 ```bash
 bun --cwd=sgs_frontend run build:docs
 ```
+
+## Links
+https://developers.stellar.org/
+https://risczero.com/
+https://jamesbachini.com
+https://www.youtube.com/c/JamesBachini
+https://bachini.substack.com
+https://x.com/james_bachini
+https://www.linkedin.com/in/james-bachini/
+https://github.com/jamesbachini
+
+## 📄 License
+
+MIT License - see LICENSE file
+
+
+**Built with ❤️ for Stellar developers**

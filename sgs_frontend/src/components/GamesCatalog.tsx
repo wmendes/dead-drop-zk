@@ -3,6 +3,7 @@ import { TwentyOneGame } from '../games/twenty-one/TwentyOneGame';
 import { NumberGuessGame } from '../games/number-guess/NumberGuessGame';
 import { DiceDuelGame } from '../games/dice-duel/DiceDuelGame';
 import { useWallet } from '@/hooks/useWallet';
+import typezeroHero from '../assets/typezero-hero.png';
 import './GamesCatalog.css';
 
 const games = [
@@ -142,6 +143,35 @@ export function GamesCatalog({ onBack }: GamesCatalogProps) {
           </button>
         ))}
       </div>
+
+      <section className="zk-section">
+        <div className="zk-header">
+          <h3>Zero Knowledge Games</h3>
+        </div>
+        <div className="zk-grid">
+          <a
+            className="zk-card"
+            href="https://github.com/jamesbachini/typezero/"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <div className="zk-card-text">
+              <div className="zk-card-title">TypeZero</div>
+              <p className="zk-card-description">
+                A typing game built with RISC Zero and Stellar.
+              </p>
+              <div className="zk-card-cta">Open on GitHub</div>
+            </div>
+            <div className="zk-media">
+              <img
+                src={typezeroHero}
+                alt="TypeZero gameplay screenshot"
+                loading="lazy"
+              />
+            </div>
+          </a>
+        </div>
+      </section>
     </div>
   );
 }
