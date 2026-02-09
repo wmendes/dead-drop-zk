@@ -288,8 +288,35 @@ if (shouldEnsureMock) {
   }
 }
 
+// Deploy mock-verifier first if requested (no constructor args)
+const mockVerifierContract = contracts.find((c) => c.packageName === "mock-verifier");
+let mockVerifierId = deployed["mock-verifier"] || "";
+if (mockVerifierContract) {
+  console.log(`Deploying ${mockVerifierContract.packageName}...`);
+  try {
+    console.log("  Installing WASM...");
+    const installResult =
+      await $`stellar contract install --wasm ${mockVerifierContract.wasmPath} --source-account ${adminSecret} --network ${NETWORK}`.text();
+    const wasmHash = installResult.trim();
+    console.log(`  WASM hash: ${wasmHash}`);
+
+    console.log("  Deploying (no constructor)...");
+    const deployResult =
+      await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK}`.text();
+    const contractId = deployResult.trim();
+    deployed[mockVerifierContract.packageName] = contractId;
+    mockVerifierId = contractId;
+    console.log(`✅ ${mockVerifierContract.packageName} deployed: ${contractId}\n`);
+  } catch (error) {
+    console.error(`❌ Failed to deploy ${mockVerifierContract.packageName}:`, error);
+    process.exit(1);
+  }
+}
+
+// Deploy remaining contracts
 for (const contract of contracts) {
   if (contract.isMockHub) continue;
+  if (contract.packageName === "mock-verifier") continue; // already deployed above
 
   console.log(`Deploying ${contract.packageName}...`);
   try {
@@ -300,8 +327,24 @@ for (const contract of contracts) {
     console.log(`  WASM hash: ${wasmHash}`);
 
     console.log("  Deploying and initializing...");
-    const deployResult =
-      await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId}`.text();
+    let deployResult: string;
+
+    if (contract.packageName === "dead-drop") {
+      // dead-drop needs verifier_id and ping_image_id in addition to admin + game_hub
+      const verifierId = mockVerifierId || existingContractIds["mock-verifier"] || "";
+      if (!verifierId) {
+        console.error("❌ mock-verifier contract ID required for dead-drop. Deploy mock-verifier first.");
+        process.exit(1);
+      }
+      // Use a zeroed-out image ID for mock mode; update via set_image_id later for real ZK
+      const pingImageId = "0707070707070707070707070707070707070707070707070707070707070707";
+      deployResult =
+        (await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId} --verifier-id ${verifierId} --ping-image-id ${pingImageId}`.text());
+    } else {
+      deployResult =
+        (await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId}`.text());
+    }
+
     const contractId = deployResult.trim();
     deployed[contract.packageName] = contractId;
     console.log(`✅ ${contract.packageName} deployed: ${contractId}\n`);

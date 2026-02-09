@@ -1,0 +1,326 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap");
+@import "leaflet/dist/leaflet.css";
+@import "tailwindcss";
+
+@theme {
+  --font-mono: 'IBM Plex Mono', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
+}
+
+/* Base Styles */
+@layer base {
+  body {
+    @apply bg-slate-950 text-slate-100 font-mono overflow-x-hidden;
+    background-color: #020617;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* Components */
+@layer components {
+
+  /* CRT Scanline Effect */
+  .spy-scanlines {
+    position: relative;
+  }
+
+  .spy-scanlines::before {
+    content: " ";
+    display: block;
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    right: 0;
+    background: linear-gradient(to bottom,
+        rgba(18, 16, 16, 0) 50%,
+        rgba(0, 0, 0, 0.25) 50%);
+    background-size: 100% 4px;
+    z-index: 50;
+    pointer-events: none;
+  }
+
+  .spy-scanlines::after {
+    content: " ";
+    display: block;
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    right: 0;
+    background: repeating-linear-gradient(0deg,
+        transparent,
+        transparent 2px,
+        rgba(0, 255, 100, 0.03) 2px,
+        rgba(0, 255, 100, 0.03) 4px);
+    z-index: 50;
+    pointer-events: none;
+    animation: flicker 0.15s infinite;
+  }
+
+  /* Radar Animation */
+  .spy-radar-container {
+    position: relative;
+    border-radius: 50%;
+    border: 1px solid rgba(74, 222, 128, 0.3);
+    background: radial-gradient(circle, rgba(74, 222, 128, 0.1) 0%, rgba(0, 26, 13, 0.6) 70%);
+    box-shadow: 0 0 15px rgba(74, 222, 128, 0.2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+
+  .spy-radar-sweep {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 50%;
+    height: 2px;
+    background: linear-gradient(to right, rgba(74, 222, 128, 0), #4ade80);
+    transform-origin: 0 50%;
+    animation: radar-sweep 3s linear infinite;
+    box-shadow: 0 0 10px #4ade80;
+  }
+
+  /* Dossier Card */
+  .spy-dossier-card {
+    background: rgba(0, 26, 13, 0.8);
+    border: 1px solid rgba(74, 222, 128, 0.3);
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.5);
+    position: relative;
+    overflow: hidden;
+    /* border-left: 3px solid #4ade80; */
+  }
+
+  .spy-dossier-card::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 2px;
+    background: #4ade80;
+    opacity: 0.5;
+    animation: scanline 3s linear infinite;
+    pointer-events: none;
+  }
+
+  .spy-classified-stamp {
+    border: 2px solid #4ade80;
+    color: #4ade80;
+    font-weight: bold;
+    text-transform: uppercase;
+    padding: 0.25rem 0.5rem;
+    letter-spacing: 0.1em;
+    transform: rotate(-5deg);
+    display: inline-block;
+    text-shadow: 0 0 5px rgba(74, 222, 128, 0.5);
+    box-shadow: 0 0 5px rgba(74, 222, 128, 0.3);
+  }
+
+  .spy-input {
+    @apply w-full px-4 py-3 rounded bg-slate-900/80 border border-slate-700 text-slate-200 outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/50 transition-all font-mono;
+  }
+
+  .spy-button {
+    @apply px-4 py-2 rounded font-bold uppercase tracking-wider transition-all disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .spy-button-primary {
+    @apply bg-emerald-500/20 text-emerald-400 border border-emerald-500/50 hover:bg-emerald-500/30;
+  }
+
+  .spy-button-primary:hover {
+    box-shadow: 0 0 15px rgba(16, 185, 129, 0.3);
+  }
+
+  .spy-button-secondary {
+    @apply bg-slate-800/50 text-slate-400 border border-slate-700 hover:bg-slate-700/50 hover:text-slate-300;
+  }
+
+  /* Scrollbar override */
+  .spy-scrollbar::-webkit-scrollbar {
+    width: 4px;
+  }
+
+  .spy-scrollbar::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.3);
+  }
+
+  .spy-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(74, 222, 128, 0.3);
+    border-radius: 2px;
+  }
+
+  .spy-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgba(74, 222, 128, 0.5);
+  }
+}
+
+/* Animations */
+@keyframes flicker {
+  0% {
+    opacity: 0.05;
+  }
+
+  5% {
+    opacity: 0.1;
+  }
+
+  10% {
+    opacity: 0.05;
+  }
+
+  15% {
+    opacity: 0.15;
+  }
+
+  20% {
+    opacity: 0.05;
+  }
+
+  50% {
+    opacity: 0.05;
+  }
+
+  55% {
+    opacity: 0.1;
+  }
+
+  60% {
+    opacity: 0.05;
+  }
+
+  100% {
+    opacity: 0.05;
+  }
+}
+
+@keyframes radar-sweep {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes scanline {
+  0% {
+    transform: translateY(-100%);
+  }
+
+  100% {
+    transform: translateY(400%);
+  }
+}
+
+/* Utility classes for shadow glow (can use tailwind arbitrary values usually, but defining here for safety) */
+.shadow-glow-green {
+  text-shadow: 0 0 10px rgba(74, 222, 128, 0.6);
+}
+
+.shadow-glow-amber {
+  text-shadow: 0 0 10px rgba(251, 191, 36, 0.6);
+}
+
+.shadow-glow-red {
+  text-shadow: 0 0 10px rgba(255, 107, 107, 0.6);
+}
+
+/* ========================================================================
+   Phone Frame (desktop only)
+   ======================================================================== */
+
+.phone-frame-wrapper {
+  display: none;
+}
+
+.phone-mobile-view {
+  display: contents;
+}
+
+@media (min-width: 768px) {
+  .phone-frame-wrapper {
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 2rem 1rem;
+    min-height: 100vh;
+  }
+
+  .phone-mobile-view {
+    display: none;
+  }
+
+  .phone-bezel {
+    position: relative;
+    width: 390px;
+    height: 844px;
+    background: #000;
+    border-radius: 50px;
+    border: 6px solid #334155;
+    box-shadow:
+      0 0 0 2px #0f172a,
+      0 25px 60px rgba(0, 0, 0, 0.6),
+      0 0 40px rgba(245, 158, 11, 0.05),
+      inset 0 0 0 2px rgba(71, 85, 105, 0.3);
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .phone-notch {
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 120px;
+    height: 28px;
+    background: #000;
+    border-radius: 0 0 18px 18px;
+    z-index: 10;
+  }
+
+  .phone-notch::before {
+    content: '';
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 8px;
+    height: 8px;
+    background: #1e293b;
+    border-radius: 50%;
+    box-shadow: 0 0 4px rgba(148, 163, 184, 0.2);
+  }
+
+  .phone-screen {
+    position: absolute;
+    inset: 0;
+    border-radius: 44px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%);
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .phone-screen::-webkit-scrollbar {
+    display: none;
+  }
+
+  .phone-home-indicator {
+    position: absolute;
+    bottom: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 134px;
+    height: 5px;
+    background: rgba(148, 163, 184, 0.3);
+    border-radius: 100px;
+    z-index: 10;
+  }
+}

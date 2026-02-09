@@ -1,0 +1,183 @@
+/* ================================================
+   WALLET SWITCHER — Cold War Spy Terminal Theme
+   ================================================ */
+
+.wallet-switcher {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  align-items: flex-end;
+}
+
+.wallet-info {
+  display: flex;
+  align-items: center;
+}
+
+/* Wallet Status Container — Terminal Panel */
+.wallet-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  background: rgba(0, 20, 10, 0.85);
+  border: 1px solid rgba(74, 222, 128, 0.2);
+  border-radius: 2px;
+  transition: all 0.2s ease;
+  backdrop-filter: blur(8px);
+}
+
+.wallet-status:hover {
+  border-color: rgba(74, 222, 128, 0.4);
+  box-shadow: 0 0 10px rgba(74, 222, 128, 0.1);
+}
+
+.wallet-status.connected {
+  border-color: rgba(74, 222, 128, 0.35);
+}
+
+.wallet-status.connecting {
+  border-color: rgba(251, 191, 36, 0.35);
+}
+
+/* Status Indicator — Terminal LED */
+.status-indicator {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: rgba(74, 222, 128, 0.3);
+}
+
+.wallet-status.connected .status-indicator {
+  background: var(--spy-terminal-green);
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.6);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.wallet-status.connecting .status-indicator {
+  background: var(--spy-terminal-amber);
+  box-shadow: 0 0 6px rgba(251, 191, 36, 0.5);
+  animation: pulse 1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.4;
+  }
+}
+
+/* Wallet Details */
+.wallet-details {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.wallet-label {
+  font-size: 0.5rem;
+  font-weight: 600;
+  color: rgba(74, 222, 128, 0.6);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  font-family: var(--font-mono);
+}
+
+.wallet-address {
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: var(--spy-terminal-green);
+  font-family: var(--font-mono);
+  text-shadow: 0 0 6px rgba(74, 222, 128, 0.3);
+}
+
+.status-text {
+  font-size: 0.6rem;
+  font-weight: 500;
+  color: rgba(74, 222, 128, 0.6);
+  font-family: var(--font-mono);
+  letter-spacing: 0.1em;
+}
+
+/* Switch Button — Terminal Action */
+.switch-button {
+  margin-left: 0.5rem;
+  padding: 0.3rem 0.6rem;
+  background: rgba(251, 191, 36, 0.15);
+  color: var(--spy-terminal-amber);
+  border: 1px solid rgba(251, 191, 36, 0.4);
+  border-radius: 2px;
+  font-weight: 700;
+  font-size: 0.5rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+
+.switch-button:hover {
+  background: rgba(251, 191, 36, 0.25);
+  border-color: rgba(251, 191, 36, 0.6);
+  box-shadow: 0 0 10px rgba(251, 191, 36, 0.2);
+  text-shadow: 0 0 6px rgba(251, 191, 36, 0.5);
+}
+
+.switch-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Error State */
+.wallet-error {
+  background: rgba(255, 107, 107, 0.1);
+  color: var(--spy-terminal-red);
+  padding: 0.4rem 0.6rem;
+  border-radius: 2px;
+  border: 1px solid rgba(255, 107, 107, 0.3);
+  font-size: 0.6rem;
+  font-family: var(--font-mono);
+  backdrop-filter: blur(8px);
+}
+
+.error-title {
+  font-size: 0.5rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  margin-bottom: 0.15rem;
+}
+
+.error-message {
+  font-size: 0.55rem;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+@media (max-width: 767px) {
+  .wallet-switcher {
+    width: 100%;
+    align-items: stretch;
+  }
+
+  .wallet-info {
+    flex-direction: column;
+  }
+
+  .wallet-status {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .switch-button {
+    width: auto;
+  }
+}
