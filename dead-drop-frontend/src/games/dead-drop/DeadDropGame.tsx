@@ -6,11 +6,12 @@ import { DEAD_DROP_CONTRACT } from '@/utils/constants';
 import { getFundedSimulationSourceAddress } from '@/utils/simulationUtils';
 import { Buffer } from 'buffer';
 import type { Game } from './bindings';
+import { GameStatus } from './bindings';
 import { GameMap, gridToLatLng, formatLatLng } from './GameMap';
 import { Modal } from './components/Modal';
 import { ToastSystem } from './components/ToastSystem';
 import { ActionButton } from './components/ActionPanel';
-import { Loader2, Crosshair, History, Info, Target, RefreshCw, Copy, Check, Zap } from 'lucide-react';
+import { Loader2, Crosshair, History, Info, Target, Copy, Check } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const GRID_SIZE = 100;
@@ -103,7 +104,7 @@ const createRandomSessionId = (): number => {
 const deadDropService = new DeadDropService(DEAD_DROP_CONTRACT);
 const MOCK_IMAGE_ID = Buffer.alloc(32, 7);
 
-type GamePhase = 'create' | 'commit' | 'waiting_commit' | 'my_turn' | 'opponent_turn' | 'game_over';
+type GamePhase = 'create' | 'waiting_opponent' | 'commit' | 'waiting_commit' | 'my_turn' | 'opponent_turn' | 'game_over';
 
 interface DeadDropGameProps {
   userAddress: string;
@@ -121,7 +122,7 @@ export function DeadDropGame({
   onStandingsRefresh,
   onGameComplete
 }: DeadDropGameProps) {
-  const DEFAULT_POINTS = '0.1';
+  const DEFAULT_POINTS = '1';
   const POINTS_DECIMALS = 7;
   const { getContractSigner } = useWallet();
 
@@ -131,12 +132,12 @@ export function DeadDropGame({
   const [playerSecret, setPlayerSecret] = useState<PlayerSecret | null>(null);
   const [pingHistory, setPingHistory] = useState<PingResult[]>([]);
 
-  const [createMode, setCreateMode] = useState<'create' | 'import' | 'load'>('create');
-  const [player1Points, setPlayer1Points] = useState(DEFAULT_POINTS);
+  const [createMode, setCreateMode] = useState<'create' | 'import' | 'load' | 'join'>('create');
   const [exportedAuthEntryXDR, setExportedAuthEntryXDR] = useState<string | null>(null);
   const [importAuthEntryXDR, setImportAuthEntryXDR] = useState('');
   const [importPlayer2Points, setImportPlayer2Points] = useState(DEFAULT_POINTS);
   const [loadSessionId, setLoadSessionId] = useState('');
+  const [joinRoomCode, setJoinRoomCode] = useState('');
 
   const [selectedCell, setSelectedCell] = useState<{ x: number; y: number } | null>(null);
   const [showDebug, setShowDebug] = useState(false);
@@ -179,16 +180,18 @@ export function DeadDropGame({
     if (!isP1 && !isP2) return 'create';
     if (game.winner) return 'game_over';
 
-    const statusVal = typeof game.status === 'number' ? game.status : 0;
     const emptyCommitment = Buffer.alloc(32, 0);
 
     const myCommitmentEmpty = isP1
       ? Buffer.from(game.commitment1 as any).equals(emptyCommitment)
       : Buffer.from(game.commitment2 as any).equals(emptyCommitment);
 
-    if (statusVal <= 1 && myCommitmentEmpty) return 'commit';
-    if (statusVal <= 1) return 'waiting_commit';
-    if (statusVal === 2) {
+    const isPreActive = game.status === GameStatus.Created || game.status === GameStatus.Committing;
+    const isActive = game.status === GameStatus.Active;
+
+    if (isPreActive && myCommitmentEmpty) return 'commit';
+    if (isPreActive) return 'waiting_commit';
+    if (isActive) {
       const isMyTurn = (game.whose_turn === 1 && isP1) || (game.whose_turn === 2 && isP2);
       return isMyTurn ? 'my_turn' : 'opponent_turn';
     }
@@ -199,6 +202,16 @@ export function DeadDropGame({
   useEffect(() => {
     if (gamePhase === 'create') return;
     const load = async () => {
+      // While waiting for opponent to join the lobby, check if game has been created
+      if (gamePhase === 'waiting_opponent') {
+        const game = await deadDropService.getGame(sessionId).catch(() => null);
+        if (game) {
+          setGameState(game);
+          setGamePhase(derivePhase(game));
+        }
+        return;
+      }
+
       const game = await deadDropService.getGame(sessionId);
       if (game) {
         setGameState(game);
@@ -225,6 +238,26 @@ export function DeadDropGame({
     } else { setPlayerSecret(null); }
   }, [sessionId, userAddress]);
 
+  // Reset game state when the active player address changes and they are not in the current game
+  useEffect(() => {
+    if (gamePhase === 'create') return; // already on create screen, nothing to do
+    if (gameState && (gameState.player1 === userAddress || gameState.player2 === userAddress)) {
+      return; // new address is a participant in the running game — keep state
+    }
+    // New address is not a participant (or no game exists yet) — reset to create
+    actionLock.current = false;
+    setGamePhase('create');
+    setSessionId(createRandomSessionId());
+    setGameState(null);
+    setPlayerSecret(null);
+    setPingHistory([]);
+    setSelectedCell(null);
+    setLoading(false);
+    setExportedAuthEntryXDR(null);
+    setCopied(false);
+    setCreateMode('create');
+  }, [userAddress]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const getDropCoords = useCallback((): { x: number; y: number } | null => {
     if (!playerSecret || !gameState) return null;
     const isP1 = gameState.player1 === userAddress;
@@ -238,44 +271,6 @@ export function DeadDropGame({
   }, [playerSecret, gameState, sessionId, userAddress]);
 
   // Actions
-  const handleQuickMatch = async () => {
-    await runAction(async () => {
-      try {
-        setLoading(true);
-        showToast('Starting match...', 'info');
-
-        const stakePoints = parsePoints(DEFAULT_POINTS) || 1000000n;
-
-        // Get signers for both players
-        const player1Signer = devWalletService.getSignerForPlayer(1);
-        const player2Signer = devWalletService.getSignerForPlayer(2);
-        const player1Address = devWalletService.getPublicKeyForPlayer(1);
-        const player2Address = devWalletService.getPublicKeyForPlayer(2);
-
-        // Use the dedicated quick match method
-        await deadDropService.quickMatchStart(
-          sessionId,
-          player1Address,
-          player2Address,
-          player1Signer,
-          player2Signer,
-          stakePoints
-        );
-
-        // Load the game
-        const game = await deadDropService.getGame(sessionId);
-        setGameState(game);
-        setGamePhase('commit');
-        onStandingsRefresh();
-        showToast('Match started!', 'success');
-      } catch (err: any) {
-        showToast(err.message || 'Failed to start match', 'error');
-      } finally {
-        setLoading(false);
-      }
-    });
-  };
-
   const handleImportAndStart = async () => {
     await runAction(async () => {
       try {
@@ -313,6 +308,58 @@ export function DeadDropGame({
         showToast('Game loaded!', 'success');
       } catch (err: any) {
         showToast(err.message || 'Failed to load', 'error');
+      } finally { setLoading(false); }
+    });
+  };
+
+  const handleOpenGame = async () => {
+    await runAction(async () => {
+      try {
+        setLoading(true);
+        showToast('Opening lobby...', 'info');
+
+        const hostPoints = parsePoints(DEFAULT_POINTS);
+        if (!hostPoints || hostPoints <= 0n) throw new Error('Enter valid points');
+
+        const signer = getContractSigner();
+        await deadDropService.openGame(sessionId, userAddress, hostPoints, signer);
+
+        setGamePhase('waiting_opponent');
+        onStandingsRefresh();
+        showToast('Lobby opened! Share the room code: ' + sessionId, 'success');
+      } catch (err: any) {
+        showToast(err.message || 'Failed to open lobby', 'error');
+      } finally { setLoading(false); }
+    });
+  };
+
+  const handleJoinGame = async () => {
+    await runAction(async () => {
+      try {
+        setLoading(true);
+        showToast('Joining lobby...', 'info');
+
+        const roomCode = parseInt(joinRoomCode.trim());
+        if (isNaN(roomCode) || roomCode <= 0) throw new Error('Enter a valid room code');
+
+        const joinerPoints = parsePoints(DEFAULT_POINTS);
+        if (!joinerPoints || joinerPoints <= 0n) throw new Error('Enter valid points');
+
+        // Check if lobby exists
+        const lobby = await deadDropService.getLobby(roomCode);
+        if (!lobby) throw new Error('Lobby not found or expired');
+
+        const signer = getContractSigner();
+        await deadDropService.joinGame(roomCode, userAddress, joinerPoints, signer);
+
+        setSessionId(roomCode);
+        const game = await deadDropService.getGame(roomCode);
+        setGameState(game);
+        setGamePhase('commit');
+        onStandingsRefresh();
+        showToast('Joined game!', 'success');
+      } catch (err: any) {
+        showToast(err.message || 'Failed to join game', 'error');
       } finally { setLoading(false); }
     });
   };
@@ -407,7 +454,8 @@ export function DeadDropGame({
     setSelectedCell(null); setLoading(false);
     setCreateMode('create'); setExportedAuthEntryXDR(null);
     setImportAuthEntryXDR(''); setImportPlayer2Points(DEFAULT_POINTS);
-    setLoadSessionId(''); setCopied(false); setPlayer1Points(DEFAULT_POINTS);
+    setLoadSessionId(''); setCopied(false);
+    setJoinRoomCode('');
     setShowDebug(false); setShowGameOverModal(false);
   };
 
@@ -452,13 +500,13 @@ export function DeadDropGame({
       )}
 
       <div className="flex-1 flex flex-col">
-        {/* CREATE SCREEN - Quick Match */}
+        {/* CREATE SCREEN - Lobby or Quick Match */}
         {gamePhase === 'create' && (
           <div className="flex-1 flex items-center justify-center p-8">
             <motion.div
               initial={{ opacity: 0, scale: 0.9 }}
               animate={{ opacity: 1, scale: 1 }}
-              className="text-center space-y-8 max-w-xs"
+              className="text-center space-y-6 max-w-sm"
             >
               <div className="space-y-2">
                 <h1 className="text-2xl font-black text-emerald-400 uppercase tracking-widest">Dead Drop</h1>
@@ -469,16 +517,113 @@ export function DeadDropGame({
                 <Target className="w-10 h-10 text-emerald-400" />
               </div>
 
-              <ActionButton
-                label="Quick Match"
-                onClick={handleQuickMatch}
-                loading={loading}
-                variant="primary"
-                fullWidth
-                icon={<Zap className="w-4 h-4" />}
-              />
+              {/* Tabs for Create Lobby / Join Game */}
+              <div className="flex gap-2 bg-black/40 rounded-lg p-1">
+                <button
+                  onClick={() => setCreateMode('create')}
+                  className={`flex-1 py-2 px-3 rounded text-xs font-semibold transition-all ${
+                    createMode === 'create'
+                      ? 'bg-emerald-500/30 text-emerald-400'
+                      : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                  Create Lobby
+                </button>
+                <button
+                  onClick={() => setCreateMode('join')}
+                  className={`flex-1 py-2 px-3 rounded text-xs font-semibold transition-all ${
+                    createMode === 'join'
+                      ? 'bg-emerald-500/30 text-emerald-400'
+                      : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                  Join Game
+                </button>
+              </div>
 
-              <p className="text-[10px] text-slate-600 uppercase tracking-wide">Dev Mode • Auto Match</p>
+              {/* Create Lobby Tab */}
+              {createMode === 'create' && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  className="space-y-4"
+                >
+                  <ActionButton
+                    label="Open Lobby"
+                    onClick={handleOpenGame}
+                    loading={loading}
+                    variant="primary"
+                    fullWidth
+                    icon={<Target className="w-4 h-4" />}
+                  />
+                </motion.div>
+              )}
+
+              {/* Join Game Tab */}
+              {createMode === 'join' && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  className="space-y-4"
+                >
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-2 uppercase tracking-wide">Room Code</label>
+                    <input
+                      type="text"
+                      value={joinRoomCode}
+                      onChange={(e) => setJoinRoomCode(e.target.value)}
+                      placeholder="12345"
+                      disabled={loading}
+                      className="w-full px-3 py-2 bg-black/50 border border-emerald-500/20 rounded text-sm text-emerald-400 placeholder-slate-600 focus:outline-none focus:border-emerald-500"
+                    />
+                  </div>
+                  <ActionButton
+                    label="Join"
+                    onClick={handleJoinGame}
+                    loading={loading}
+                    variant="primary"
+                    fullWidth
+                    icon={<Target className="w-4 h-4" />}
+                  />
+                </motion.div>
+              )}
+            </motion.div>
+          </div>
+        )}
+
+        {/* WAITING FOR OPPONENT - Lobby Created */}
+        {gamePhase === 'waiting_opponent' && (
+          <div className="flex-1 flex items-center justify-center p-8">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="text-center space-y-6 max-w-sm"
+            >
+              <Loader2 className="w-12 h-12 text-cyan-400 mx-auto animate-spin" />
+
+              <div>
+                <h2 className="text-lg font-bold text-cyan-400 uppercase tracking-widest">Waiting for Opponent</h2>
+                <p className="text-xs text-slate-500 mt-2">Share this room code with your opponent</p>
+              </div>
+
+              <div className="bg-black/60 rounded-lg p-4 border border-cyan-500/30">
+                <div className="text-[10px] text-slate-500 uppercase tracking-widest mb-2">Room Code</div>
+                <div className="text-3xl font-black text-cyan-400 font-mono mb-3">{sessionId}</div>
+                <button
+                  onClick={() => copyToClipboard(sessionId.toString())}
+                  className="w-full py-2 px-3 bg-cyan-500/20 hover:bg-cyan-500/30 rounded text-xs text-cyan-400 uppercase tracking-wide transition-colors flex items-center justify-center gap-2"
+                >
+                  {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                  {copied ? 'Copied!' : 'Copy'}
+                </button>
+              </div>
+
+              <ActionButton
+                label="Cancel"
+                onClick={handleStartNewGame}
+                variant="default"
+                fullWidth
+              />
             </motion.div>
           </div>
         )}
