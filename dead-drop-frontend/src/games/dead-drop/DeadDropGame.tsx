@@ -11,8 +11,9 @@ import { GameMap, gridToLatLng, formatLatLng } from './GameMap';
 import { Modal } from './components/Modal';
 import { ToastSystem } from './components/ToastSystem';
 import { ActionButton } from './components/ActionPanel';
-import { Loader2, Crosshair, History, Info, Target, Copy, Check } from 'lucide-react';
+import { Loader2, Crosshair, History, Info, Target, Copy, Check, Volume2, VolumeX } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { useSoundEngine } from './useSoundEngine';
 
 const GRID_SIZE = 100;
 const MAX_TURNS = 30;
@@ -125,6 +126,7 @@ export function DeadDropGame({
   const DEFAULT_POINTS = '1';
   const POINTS_DECIMALS = 7;
   const { getContractSigner } = useWallet();
+  const sound = useSoundEngine();
 
   const [sessionId, setSessionId] = useState<number>(() => createRandomSessionId());
   const [gameState, setGameState] = useState<Game | null>(null);
@@ -201,10 +203,12 @@ export function DeadDropGame({
   // Poll game state
   useEffect(() => {
     if (gamePhase === 'create') return;
+    let cancelled = false;
     const load = async () => {
       // While waiting for opponent to join the lobby, check if game has been created
       if (gamePhase === 'waiting_opponent') {
         const game = await deadDropService.getGame(sessionId).catch(() => null);
+        if (cancelled) return;
         if (game) {
           setGameState(game);
           setGamePhase(derivePhase(game));
@@ -213,19 +217,32 @@ export function DeadDropGame({
       }
 
       const game = await deadDropService.getGame(sessionId);
+      if (cancelled) return;
       if (game) {
         setGameState(game);
         const newPhase = derivePhase(game);
         if (newPhase === 'game_over' && gamePhase !== 'game_over') {
           setShowGameOverModal(true);
+          // Play victory or defeat sound
+          if (game.winner === userAddress) {
+            sound.playVictory();
+          } else {
+            sound.playDefeat();
+          }
+        }
+        if (newPhase === 'my_turn' && gamePhase !== 'my_turn') {
+          sound.playMyTurn();
         }
         setGamePhase(newPhase);
       }
     };
     load();
     const interval = setInterval(load, 5000);
-    return () => clearInterval(interval);
-  }, [sessionId, gamePhase, derivePhase]);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [sessionId, gamePhase, derivePhase, sound, userAddress]);
 
   // Restore secret
   useEffect(() => {
@@ -325,6 +342,8 @@ export function DeadDropGame({
         await deadDropService.openGame(sessionId, userAddress, hostPoints, signer);
 
         setGamePhase('waiting_opponent');
+        sound.playLobbyOpened();
+        sound.startAmbient();
         onStandingsRefresh();
         showToast('Lobby opened! Share the room code: ' + sessionId, 'success');
       } catch (err: any) {
@@ -356,6 +375,8 @@ export function DeadDropGame({
         const game = await deadDropService.getGame(roomCode);
         setGameState(game);
         setGamePhase('commit');
+        sound.playOpponentJoined();
+        sound.startAmbient();
         onStandingsRefresh();
         showToast('Joined game!', 'success');
       } catch (err: any) {
@@ -377,6 +398,7 @@ export function DeadDropGame({
         const signer = getContractSigner();
         await deadDropService.commitSecret(sessionId, userAddress, commitment, signer);
         showToast('Secret committed!', 'success');
+        sound.playCommitSecret();
         const game = await deadDropService.getGame(sessionId);
         setGameState(game); setGamePhase(derivePhase(game));
       } catch (err: any) {
@@ -413,6 +435,7 @@ export function DeadDropGame({
         );
 
         const zone = getTemperatureZone(mockDistance);
+        sound.playPingResult(zone);
         setPingHistory(prev => [...prev, {
           turn: gameState.current_turn, x: selectedCell.x, y: selectedCell.y, distance: mockDistance, zone
         }]);
@@ -438,6 +461,7 @@ export function DeadDropGame({
         const signer = getContractSigner();
         await deadDropService.forceTimeout(sessionId, userAddress, signer);
         showToast('Timeout claimed!', 'success');
+        sound.playTimeout();
         const game = await deadDropService.getGame(sessionId);
         setGameState(game); setGamePhase('game_over'); setShowGameOverModal(true); onStandingsRefresh();
       } catch (err: any) {
@@ -448,6 +472,7 @@ export function DeadDropGame({
 
   const handleStartNewGame = () => {
     if (gameState?.winner) onGameComplete();
+    sound.stopAmbient();
     actionLock.current = false;
     setGamePhase('create'); setSessionId(createRandomSessionId());
     setGameState(null); setPlayerSecret(null); setPingHistory([]);
@@ -485,17 +510,27 @@ export function DeadDropGame({
             <span className="text-slate-600">/{MAX_TURNS}</span>
           </div>
 
-          <button
-            onClick={() => setShowHistoryModal(true)}
-            className="p-2 text-slate-400 hover:text-emerald-400 transition-colors relative"
-          >
-            <History className="w-5 h-5" />
-            {pingHistory.length > 0 && (
-              <span className="absolute -top-1 -right-1 w-4 h-4 bg-emerald-500 text-black text-[10px] font-bold rounded-full flex items-center justify-center">
-                {pingHistory.length}
-              </span>
-            )}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => sound.toggle()}
+              className="p-2 text-slate-400 hover:text-emerald-400 transition-colors"
+              title={sound.enabled ? 'Mute' : 'Unmute'}
+            >
+              {sound.enabled ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
+            </button>
+
+            <button
+              onClick={() => setShowHistoryModal(true)}
+              className="p-2 text-slate-400 hover:text-emerald-400 transition-colors relative"
+            >
+              <History className="w-5 h-5" />
+              {pingHistory.length > 0 && (
+                <span className="absolute -top-1 -right-1 w-4 h-4 bg-emerald-500 text-black text-[10px] font-bold rounded-full flex items-center justify-center">
+                  {pingHistory.length}
+                </span>
+              )}
+            </button>
+          </div>
         </div>
       )}
 
