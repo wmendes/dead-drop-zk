@@ -151,11 +151,11 @@ fn test_start_game() {
 }
 
 #[test]
-#[should_panic(expected = "Cannot play against yourself")]
 fn test_self_play_rejected() {
     let (_env, client, player1, _player2) = setup_test();
     let same = player1.clone();
-    client.start_game(&1u32, &player1, &same, &100_0000000, &100_0000000);
+    let result = client.try_start_game(&1u32, &player1, &same, &100_0000000, &100_0000000);
+    assert_dead_drop_error(&result, Error::SelfPlay);
 }
 
 #[test]
@@ -231,7 +231,7 @@ fn test_submit_ping() {
     let seal = Bytes::from_slice(&env, &[1, 2, 3]);
 
     let result = client.submit_ping(
-        &session_id, &player1, &0u32, &distance, &journal_hash, &image_id, &seal,
+        &session_id, &player1, &0u32, &distance, &0u32, &0u32, &journal_hash, &image_id, &seal,
     );
     assert!(result.is_none()); // No winner yet
 
@@ -258,7 +258,7 @@ fn test_wrong_turn_rejected() {
     let seal = Bytes::from_slice(&env, &[1, 2, 3]);
 
     let result = client.try_submit_ping(
-        &session_id, &player2, &0u32, &10u32, &journal_hash, &image_id, &seal,
+        &session_id, &player2, &0u32, &10u32, &0u32, &0u32, &journal_hash, &image_id, &seal,
     );
     assert_dead_drop_error(&result, Error::NotYourTurn);
 }
@@ -281,7 +281,7 @@ fn test_distance_zero_wins() {
     let seal = Bytes::from_slice(&env, &[1, 2, 3]);
 
     let result = client.submit_ping(
-        &session_id, &player1, &0u32, &0u32, &journal_hash, &image_id, &seal,
+        &session_id, &player1, &0u32, &0u32, &0u32, &0u32, &journal_hash, &image_id, &seal,
     );
     assert!(result.is_some());
     assert_eq!(result.unwrap(), player1);
@@ -313,7 +313,7 @@ fn test_30_turns_closest_wins() {
             let distance = 5u32;
             let journal_hash = make_journal_hash(&env, session_id, turn, distance, &c2);
             let result = client.submit_ping(
-                &session_id, &player1, &turn, &distance, &journal_hash, &image_id, &seal,
+                &session_id, &player1, &turn, &distance, &0u32, &0u32, &journal_hash, &image_id, &seal,
             );
             if turn == 29 {
                 // This shouldn't happen since turn 29 is odd
@@ -327,7 +327,7 @@ fn test_30_turns_closest_wins() {
             let distance = 10u32;
             let journal_hash = make_journal_hash(&env, session_id, turn, distance, &c1);
             let result = client.submit_ping(
-                &session_id, &player2, &turn, &distance, &journal_hash, &image_id, &seal,
+                &session_id, &player2, &turn, &distance, &0u32, &0u32, &journal_hash, &image_id, &seal,
             );
             if turn == 29 {
                 // Last turn → game ends
@@ -397,7 +397,7 @@ fn test_invalid_image_id_rejected() {
     let seal = Bytes::from_slice(&env, &[1, 2, 3]);
 
     let result = client.try_submit_ping(
-        &session_id, &player1, &0u32, &10u32, &journal_hash, &wrong_image_id, &seal,
+        &session_id, &player1, &0u32, &10u32, &0u32, &0u32, &journal_hash, &wrong_image_id, &seal,
     );
     assert_dead_drop_error(&result, Error::InvalidImageId);
 }
@@ -419,7 +419,7 @@ fn test_invalid_journal_hash_rejected() {
     let seal = Bytes::from_slice(&env, &[1, 2, 3]);
 
     let result = client.try_submit_ping(
-        &session_id, &player1, &0u32, &10u32, &wrong_journal_hash, &image_id, &seal,
+        &session_id, &player1, &0u32, &10u32, &0u32, &0u32, &wrong_journal_hash, &image_id, &seal,
     );
     assert_dead_drop_error(&result, Error::InvalidJournalHash);
 }
@@ -439,7 +439,7 @@ fn test_cannot_ping_before_active() {
     let seal = Bytes::from_slice(&env, &[1, 2, 3]);
 
     let result = client.try_submit_ping(
-        &session_id, &player1, &0u32, &10u32, &journal_hash, &image_id, &seal,
+        &session_id, &player1, &0u32, &10u32, &0u32, &0u32, &journal_hash, &image_id, &seal,
     );
     assert_dead_drop_error(&result, Error::InvalidGameStatus);
 }
@@ -485,7 +485,7 @@ fn test_alternating_turns() {
 
     // Turn 0: Player1 pings (verifies against c2)
     let jh0 = make_journal_hash(&env, session_id, 0, 20, &c2);
-    client.submit_ping(&session_id, &player1, &0u32, &20u32, &jh0, &image_id, &seal);
+    client.submit_ping(&session_id, &player1, &0u32, &20u32, &0u32, &0u32, &jh0, &image_id, &seal);
 
     let game = client.get_game(&session_id);
     assert_eq!(game.whose_turn, 2);
@@ -493,7 +493,7 @@ fn test_alternating_turns() {
 
     // Turn 1: Player2 pings (verifies against c1)
     let jh1 = make_journal_hash(&env, session_id, 1, 15, &c1);
-    client.submit_ping(&session_id, &player2, &1u32, &15u32, &jh1, &image_id, &seal);
+    client.submit_ping(&session_id, &player2, &1u32, &15u32, &0u32, &0u32, &jh1, &image_id, &seal);
 
     let game = client.get_game(&session_id);
     assert_eq!(game.whose_turn, 1);
@@ -518,20 +518,93 @@ fn test_best_distance_updates() {
 
     // Turn 0: Player1 gets distance 50
     let jh0 = make_journal_hash(&env, session_id, 0, 50, &c2);
-    client.submit_ping(&session_id, &player1, &0u32, &50u32, &jh0, &image_id, &seal);
+    client.submit_ping(&session_id, &player1, &0u32, &50u32, &0u32, &0u32, &jh0, &image_id, &seal);
     assert_eq!(client.get_game(&session_id).player1_best_distance, 50);
 
     // Turn 1: Player2 gets distance 30
     let jh1 = make_journal_hash(&env, session_id, 1, 30, &c1);
-    client.submit_ping(&session_id, &player2, &1u32, &30u32, &jh1, &image_id, &seal);
+    client.submit_ping(&session_id, &player2, &1u32, &30u32, &0u32, &0u32, &jh1, &image_id, &seal);
 
     // Turn 2: Player1 gets distance 10 (better!)
     let jh2 = make_journal_hash(&env, session_id, 2, 10, &c2);
-    client.submit_ping(&session_id, &player1, &2u32, &10u32, &jh2, &image_id, &seal);
+    client.submit_ping(&session_id, &player1, &2u32, &10u32, &0u32, &0u32, &jh2, &image_id, &seal);
     assert_eq!(client.get_game(&session_id).player1_best_distance, 10);
 
     // Turn 3: Player2 gets distance 40 (worse, best stays 30)
     let jh3 = make_journal_hash(&env, session_id, 3, 40, &c1);
-    client.submit_ping(&session_id, &player2, &3u32, &40u32, &jh3, &image_id, &seal);
+    client.submit_ping(&session_id, &player2, &3u32, &40u32, &0u32, &0u32, &jh3, &image_id, &seal);
     assert_eq!(client.get_game(&session_id).player2_best_distance, 30);
+}
+
+// ============================================================================
+// Lobby Tests
+// ============================================================================
+
+#[test]
+fn test_open_and_join_game() {
+    let (_env, client, player1, player2) = setup_test();
+    let session_id = 100u32;
+    let points = 100_0000000i128;
+
+    // Player1 opens a lobby
+    client.open_game(&session_id, &player1, &points);
+
+    // Lobby should exist
+    let lobby = client.get_lobby(&session_id);
+    assert_eq!(lobby.host, player1);
+    assert_eq!(lobby.host_points, points);
+
+    // Player2 joins the lobby
+    client.join_game(&session_id, &player2, &points);
+
+    // Lobby should be gone (consumed)
+    let result = client.try_get_lobby(&session_id);
+    assert_dead_drop_error(&result, crate::Error::LobbyNotFound);
+
+    // Game should exist and be in Created state
+    let game = client.get_game(&session_id);
+    assert_eq!(game.player1, player1);
+    assert_eq!(game.player2, player2);
+    assert_eq!(game.player1_points, points);
+    assert_eq!(game.player2_points, points);
+    assert_eq!(game.status, GameStatus::Created);
+}
+
+#[test]
+fn test_join_nonexistent_lobby() {
+    let (_env, client, _player1, player2) = setup_test();
+    let session_id = 101u32;
+    let points = 100_0000000i128;
+
+    // Try to join a lobby that doesn't exist
+    let result = client.try_join_game(&session_id, &player2, &points);
+    assert_dead_drop_error(&result, Error::LobbyNotFound);
+}
+
+#[test]
+fn test_join_self_play_rejected() {
+    let (_env, client, player1, _player2) = setup_test();
+    let session_id = 102u32;
+    let points = 100_0000000i128;
+
+    // Player1 opens a lobby
+    client.open_game(&session_id, &player1, &points);
+
+    // Player1 tries to join their own lobby
+    let result = client.try_join_game(&session_id, &player1, &points);
+    assert_dead_drop_error(&result, Error::SelfPlay);
+}
+
+#[test]
+fn test_open_duplicate_session_rejected() {
+    let (_env, client, player1, player2) = setup_test();
+    let session_id = 103u32;
+    let points = 100_0000000i128;
+
+    // Player1 opens a lobby
+    client.open_game(&session_id, &player1, &points);
+
+    // Try to open another lobby with the same session_id
+    let result = client.try_open_game(&session_id, &player2, &points);
+    assert_dead_drop_error(&result, Error::LobbyAlreadyExists);
 }

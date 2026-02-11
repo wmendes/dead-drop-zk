@@ -26,6 +26,7 @@ interface PingResult {
   y: number;
   distance: number;
   zone: TemperatureZone;
+  player: string;
 }
 
 interface PlayerSecret {
@@ -150,14 +151,18 @@ export function DeadDropGame({
   const [showGameOverModal, setShowGameOverModal] = useState(false);
 
   const [loading, setLoading] = useState(false);
-  const [toast, setToast] = useState<{ message: string; type: 'error' | 'success' | 'info'; id: string } | null>(null);
+  const [toast, setToast] = useState<{ message: string; type: 'error' | 'success' | 'info'; id: string; duration?: number } | null>(null);
   const [copied, setCopied] = useState(false);
 
   const actionLock = useRef(false);
 
-  const showToast = (message: string, type: 'error' | 'success' | 'info') => {
-    setToast({ message, type, id: crypto.randomUUID() });
+  const showToast = (message: string, type: 'error' | 'success' | 'info', duration?: number) => {
+    setToast({ message, type, id: crypto.randomUUID(), duration });
   };
+
+  const handleDismissToast = useCallback(() => {
+    setToast(null);
+  }, []);
 
   const parsePoints = (value: string): bigint | null => {
     try {
@@ -200,7 +205,7 @@ export function DeadDropGame({
     return 'game_over';
   }, [userAddress]);
 
-  // Poll game state
+  // Poll game state and events
   useEffect(() => {
     if (gamePhase === 'create') return;
     let cancelled = false;
@@ -216,11 +221,65 @@ export function DeadDropGame({
         return;
       }
 
-      const game = await deadDropService.getGame(sessionId);
+      const [game, events] = await Promise.all([
+        deadDropService.getGame(sessionId),
+        deadDropService.getPingEvents(sessionId).catch(() => [])
+      ]);
+
       if (cancelled) return;
+
+      if (events && events.length > 0) {
+        setPingHistory(prev => {
+          const newHistory = [...prev];
+          let changed = false;
+          events.forEach(evt => {
+            const index = newHistory.findIndex(p => p.turn === evt.turn);
+            const newEntry = {
+              turn: evt.turn,
+              x: evt.x,
+              y: evt.y,
+              distance: evt.distance,
+              zone: getTemperatureZone(evt.distance),
+              player: evt.player,
+            };
+
+            if (index !== -1) {
+              // Only update if data is different (avoid infinite loops/renders if identifying objects)
+              if (newHistory[index].distance !== newEntry.distance || newHistory[index].x !== newEntry.x) {
+                newHistory[index] = newEntry;
+                changed = true;
+              }
+            } else {
+              newHistory.push(newEntry);
+              changed = true;
+            }
+          });
+          return changed ? newHistory.sort((a, b) => a.turn - b.turn) : prev;
+        });
+      }
+
       if (game) {
-        setGameState(game);
         const newPhase = derivePhase(game);
+        const isTransitionFromOpponentTurn =
+          (newPhase === 'my_turn' || newPhase === 'game_over') &&
+          gamePhase === 'opponent_turn';
+
+        if (isTransitionFromOpponentTurn) {
+          // The opponent's ping that ended their turn should be at
+          // turn = game.current_turn - 1. If it hasn't been indexed yet,
+          // defer the game state update until the next poll so the ping
+          // and the turn change become visible at the same time.
+          const expectedTurn = game.current_turn - 1;
+          const opponentPingPresent = events.some(e => e.turn === expectedTurn);
+
+          if (!opponentPingPresent) {
+            // Skip game state + phase update this cycle.
+            // The next poll will have the event and will proceed normally.
+            return;
+          }
+        }
+
+        setGameState(game);
         if (newPhase === 'game_over' && gamePhase !== 'game_over') {
           setShowGameOverModal(true);
           // Play victory or defeat sound
@@ -305,7 +364,7 @@ export function DeadDropGame({
         setSessionId(gameParams.sessionId);
         const game = await deadDropService.getGame(gameParams.sessionId);
         setGameState(game); setGamePhase('commit'); onStandingsRefresh();
-        showToast('Game started!', 'success');
+        // showToast('Game started!', 'success'); // Redundant with UI change
       } catch (err: any) {
         showToast(err.message || 'Failed to import', 'error');
       } finally { setLoading(false); }
@@ -322,7 +381,8 @@ export function DeadDropGame({
         if (!game) throw new Error('Game not found');
         if (game.player1 !== userAddress && game.player2 !== userAddress) throw new Error('You are not a player');
         setSessionId(id); setGameState(game); setGamePhase(derivePhase(game));
-        showToast('Game loaded!', 'success');
+        sound.startAmbient();
+        // showToast('Game loaded!', 'success'); // Redundant
       } catch (err: any) {
         showToast(err.message || 'Failed to load', 'error');
       } finally { setLoading(false); }
@@ -345,7 +405,8 @@ export function DeadDropGame({
         sound.playLobbyOpened();
         sound.startAmbient();
         onStandingsRefresh();
-        showToast('Lobby opened! Share the room code: ' + sessionId, 'success');
+        onStandingsRefresh();
+        // showToast('Lobby opened! Share the room code: ' + sessionId, 'success'); // Redundant with UI
       } catch (err: any) {
         showToast(err.message || 'Failed to open lobby', 'error');
       } finally { setLoading(false); }
@@ -378,7 +439,8 @@ export function DeadDropGame({
         sound.playOpponentJoined();
         sound.startAmbient();
         onStandingsRefresh();
-        showToast('Joined game!', 'success');
+        onStandingsRefresh();
+        // showToast('Joined game!', 'success'); // Redundant
       } catch (err: any) {
         showToast(err.message || 'Failed to join game', 'error');
       } finally { setLoading(false); }
@@ -397,7 +459,7 @@ export function DeadDropGame({
         const commitment = await computeCommitment(secret);
         const signer = getContractSigner();
         await deadDropService.commitSecret(sessionId, userAddress, commitment, signer);
-        showToast('Secret committed!', 'success');
+        showToast('Secret committed', 'success', 1500);
         sound.playCommitSecret();
         const game = await deadDropService.getGame(sessionId);
         setGameState(game); setGamePhase(derivePhase(game));
@@ -431,16 +493,21 @@ export function DeadDropGame({
         const signer = getContractSigner();
         await deadDropService.submitPing(
           sessionId, userAddress, gameState.current_turn, mockDistance,
+          selectedCell.x, selectedCell.y,
           journalHash, MOCK_IMAGE_ID, Buffer.from([1, 2, 3]), signer
         );
 
         const zone = getTemperatureZone(mockDistance);
         sound.playPingResult(zone);
-        setPingHistory(prev => [...prev, {
-          turn: gameState.current_turn, x: selectedCell.x, y: selectedCell.y, distance: mockDistance, zone
-        }]);
+        setPingHistory(prev => {
+          // We optimistic update, but filter out duplicates if event comes in later
+          if (prev.some(p => p.turn === gameState.current_turn)) return prev;
+          return [...prev, {
+            turn: gameState.current_turn, x: selectedCell.x, y: selectedCell.y, distance: mockDistance, zone, player: userAddress
+          }].sort((a, b) => a.turn - b.turn)
+        });
         setSelectedCell(null);
-        showToast(mockDistance === 0 ? 'DROP FOUND!' : `${zone}`, 'info');
+        showToast(mockDistance === 0 ? 'DROP FOUND!' : `${zone} (${mockDistance}m)`, 'info', 3000);
         const updatedGame = await deadDropService.getGame(sessionId);
         setGameState(updatedGame);
         const newPhase = derivePhase(updatedGame);
@@ -460,7 +527,7 @@ export function DeadDropGame({
         setLoading(true);
         const signer = getContractSigner();
         await deadDropService.forceTimeout(sessionId, userAddress, signer);
-        showToast('Timeout claimed!', 'success');
+        showToast('Timeout claimed', 'success');
         sound.playTimeout();
         const game = await deadDropService.getGame(sessionId);
         setGameState(game); setGamePhase('game_over'); setShowGameOverModal(true); onStandingsRefresh();
@@ -487,310 +554,403 @@ export function DeadDropGame({
   const copyToClipboard = async (text: string) => {
     await navigator.clipboard.writeText(text);
     setCopied(true);
-    showToast('Copied!', 'info');
+    showToast('Copied to clipboard', 'info', 1000);
     setTimeout(() => setCopied(false), 2000);
   };
 
   // Render
   return (
-    <div className="relative min-h-full flex flex-col">
-      {/* Minimal HUD */}
-      {gamePhase !== 'create' && (
-        <div className="flex items-center justify-between px-4 py-2 bg-black/40 border-b border-emerald-500/10">
+    <div className="relative h-full flex flex-col overflow-hidden">
+      {/* Top HUD - Always visible with mute button */}
+      <div className="flex-none flex items-center justify-between px-4 py-3 bg-black/40 border-b border-emerald-500/10 z-10 backdrop-blur-sm">
+        <button
+          onClick={() => gamePhase !== 'create' && setShowInfoModal(true)}
+          className={`p-2 transition-colors ${gamePhase === 'create'
+            ? 'text-slate-600 cursor-default'
+            : 'text-slate-400 hover:text-emerald-400'
+            }`}
+        >
+          <Info className="w-5 h-5" />
+        </button>
+
+        {gamePhase !== 'create' && (
+          <div className="text-center">
+            <span className="text-[10px] text-slate-500 uppercase tracking-widest block mb-0.5">Turn</span>
+            <div className="flex items-baseline justify-center gap-0.5">
+              <span className="text-xl font-bold text-emerald-400 leading-none">{gameState?.current_turn ?? 0}</span>
+              <span className="text-xs text-slate-600 font-medium">/{MAX_TURNS}</span>
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center gap-2">
           <button
-            onClick={() => setShowInfoModal(true)}
+            onClick={() => sound.toggle()}
             className="p-2 text-slate-400 hover:text-emerald-400 transition-colors"
+            title={sound.enabled ? 'Mute' : 'Unmute'}
           >
-            <Info className="w-5 h-5" />
+            {sound.enabled ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
           </button>
 
-          <div className="text-center">
-            <span className="text-xs text-slate-500 uppercase tracking-widest">Turn</span>
-            <span className="ml-2 text-lg font-bold text-emerald-400">{gameState?.current_turn ?? 0}</span>
-            <span className="text-slate-600">/{MAX_TURNS}</span>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => sound.toggle()}
-              className="p-2 text-slate-400 hover:text-emerald-400 transition-colors"
-              title={sound.enabled ? 'Mute' : 'Unmute'}
-            >
-              {sound.enabled ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
-            </button>
-
+          {gamePhase !== 'create' && (
             <button
               onClick={() => setShowHistoryModal(true)}
               className="p-2 text-slate-400 hover:text-emerald-400 transition-colors relative"
             >
               <History className="w-5 h-5" />
               {pingHistory.length > 0 && (
-                <span className="absolute -top-1 -right-1 w-4 h-4 bg-emerald-500 text-black text-[10px] font-bold rounded-full flex items-center justify-center">
+                <span className="absolute -top-1 -right-1 w-4 h-4 bg-emerald-500 text-black text-[10px] font-bold rounded-full flex items-center justify-center border border-black">
                   {pingHistory.length}
                 </span>
               )}
             </button>
-          </div>
+          )}
         </div>
-      )}
+      </div>
 
-      <div className="flex-1 flex flex-col">
+      <div className="flex-1 flex flex-col relative overflow-hidden">
         {/* CREATE SCREEN - Lobby or Quick Match */}
         {gamePhase === 'create' && (
-          <div className="flex-1 flex items-center justify-center p-8">
+          <div className="flex-1 flex flex-col items-center justify-center p-6 pb-20 overflow-y-auto">
             <motion.div
-              initial={{ opacity: 0, scale: 0.9 }}
+              initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
-              className="text-center space-y-6 max-w-sm"
+              transition={{ duration: 0.4, ease: "easeOut" }}
+              className="w-full max-w-xs space-y-8"
             >
-              <div className="space-y-2">
-                <h1 className="text-2xl font-black text-emerald-400 uppercase tracking-widest">Dead Drop</h1>
-                <p className="text-xs text-slate-500">Find the secret location before your opponent</p>
-              </div>
+              <div className="text-center space-y-3">
+                <div className="relative inline-block">
+                  <div className="w-24 h-24 mx-auto border-2 border-emerald-500/30 rounded-full flex items-center justify-center bg-emerald-500/5 shadow-[0_0_30px_rgba(16,185,129,0.1)]">
+                    <Target className="w-12 h-12 text-emerald-400 drop-shadow-[0_0_8px_rgba(52,211,153,0.5)]" />
+                  </div>
+                  <div className="absolute inset-0 rounded-full border border-emerald-500/20 animate-ping opacity-20" />
+                </div>
 
-              <div className="w-20 h-20 mx-auto border-2 border-emerald-500/30 rounded-full flex items-center justify-center bg-emerald-500/5">
-                <Target className="w-10 h-10 text-emerald-400" />
+                <div>
+                  <h1 className="text-3xl font-black text-emerald-400 uppercase tracking-[0.2em] drop-shadow-sm">Dead Drop</h1>
+                  <p className="text-xs text-slate-500 font-medium tracking-wide mt-1">Find the secret location</p>
+                </div>
               </div>
 
               {/* Tabs for Create Lobby / Join Game */}
-              <div className="flex gap-2 bg-black/40 rounded-lg p-1">
-                <button
-                  onClick={() => setCreateMode('create')}
-                  className={`flex-1 py-2 px-3 rounded text-xs font-semibold transition-all ${
-                    createMode === 'create'
-                      ? 'bg-emerald-500/30 text-emerald-400'
-                      : 'text-slate-500 hover:text-slate-300'
-                  }`}
-                >
-                  Create Lobby
-                </button>
-                <button
-                  onClick={() => setCreateMode('join')}
-                  className={`flex-1 py-2 px-3 rounded text-xs font-semibold transition-all ${
-                    createMode === 'join'
-                      ? 'bg-emerald-500/30 text-emerald-400'
-                      : 'text-slate-500 hover:text-slate-300'
-                  }`}
-                >
-                  Join Game
-                </button>
+              <div className="bg-black/40 rounded-xl p-1.5 border border-white/5 backdrop-blur-sm">
+                <div className="flex gap-1">
+                  <button
+                    onClick={() => setCreateMode('create')}
+                    className={`flex-1 py-2.5 px-3 rounded-lg text-xs font-bold tracking-wider uppercase transition-all ${createMode === 'create'
+                      ? 'bg-emerald-500/20 text-emerald-400 shadow-sm border border-emerald-500/20'
+                      : 'text-slate-500 hover:text-slate-300 hover:bg-white/5'
+                      }`}
+                  >
+                    Create
+                  </button>
+                  <button
+                    onClick={() => setCreateMode('join')}
+                    className={`flex-1 py-2.5 px-3 rounded-lg text-xs font-bold tracking-wider uppercase transition-all ${createMode === 'join'
+                      ? 'bg-emerald-500/20 text-emerald-400 shadow-sm border border-emerald-500/20'
+                      : 'text-slate-500 hover:text-slate-300 hover:bg-white/5'
+                      }`}
+                  >
+                    Join
+                  </button>
+                </div>
               </div>
 
               {/* Create Lobby Tab */}
-              {createMode === 'create' && (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  className="space-y-4"
-                >
-                  <ActionButton
-                    label="Open Lobby"
-                    onClick={handleOpenGame}
-                    loading={loading}
-                    variant="primary"
-                    fullWidth
-                    icon={<Target className="w-4 h-4" />}
-                  />
-                </motion.div>
-              )}
-
-              {/* Join Game Tab */}
-              {createMode === 'join' && (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  className="space-y-4"
-                >
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-2 uppercase tracking-wide">Room Code</label>
-                    <input
-                      type="text"
-                      value={joinRoomCode}
-                      onChange={(e) => setJoinRoomCode(e.target.value)}
-                      placeholder="12345"
-                      disabled={loading}
-                      className="w-full px-3 py-2 bg-black/50 border border-emerald-500/20 rounded text-sm text-emerald-400 placeholder-slate-600 focus:outline-none focus:border-emerald-500"
+              <AnimatePresence mode="wait">
+                {createMode === 'create' ? (
+                  <motion.div
+                    key="create"
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    className="space-y-4 pt-2"
+                  >
+                    <ActionButton
+                      label="Open Lobby"
+                      onClick={handleOpenGame}
+                      loading={loading}
+                      variant="primary"
+                      fullWidth
+                      icon={<Target className="w-4 h-4" />}
                     />
-                  </div>
-                  <ActionButton
-                    label="Join"
-                    onClick={handleJoinGame}
-                    loading={loading}
-                    variant="primary"
-                    fullWidth
-                    icon={<Target className="w-4 h-4" />}
-                  />
-                </motion.div>
-              )}
+                    <p className="text-[10px] text-slate-600 text-center leading-relaxed">
+                      Start a new game session and invite a friend using a room code.
+                    </p>
+                  </motion.div>
+                ) : (
+                  <motion.div
+                    key="join"
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    className="space-y-5 pt-2"
+                  >
+                    <div className="space-y-2">
+                      <label className="block text-[10px] uppercase tracking-widest text-slate-400 font-bold ml-1">Room Code</label>
+                      <div className="relative group">
+                        <input
+                          type="text"
+                          value={joinRoomCode}
+                          onChange={(e) => setJoinRoomCode(e.target.value)}
+                          placeholder="ENTER CODE"
+                          disabled={loading}
+                          className="w-full h-12 px-4 bg-black/50 border border-emerald-500/20 rounded-lg text-center text-lg font-mono text-emerald-400 placeholder-slate-700 focus:outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/50 transition-all uppercase tracking-widest"
+                        />
+                        <div className="absolute inset-0 border border-transparent group-hover:border-emerald-500/10 rounded-lg pointer-events-none transition-colors" />
+                      </div>
+                    </div>
+                    <ActionButton
+                      label="Join Game"
+                      onClick={handleJoinGame}
+                      loading={loading}
+                      variant="primary"
+                      fullWidth
+                      icon={<Target className="w-4 h-4" />}
+                    />
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </motion.div>
           </div>
         )}
 
         {/* WAITING FOR OPPONENT - Lobby Created */}
         {gamePhase === 'waiting_opponent' && (
-          <div className="flex-1 flex items-center justify-center p-8">
+          <div className="flex-1 flex flex-col items-center justify-center p-8 pb-20">
             <motion.div
-              initial={{ opacity: 0, scale: 0.9 }}
+              initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
-              className="text-center space-y-6 max-w-sm"
+              className="w-full max-w-xs text-center flex flex-col items-center gap-8"
             >
-              <Loader2 className="w-12 h-12 text-cyan-400 mx-auto animate-spin" />
-
-              <div>
-                <h2 className="text-lg font-bold text-cyan-400 uppercase tracking-widest">Waiting for Opponent</h2>
-                <p className="text-xs text-slate-500 mt-2">Share this room code with your opponent</p>
+              <div className="relative">
+                <div className="absolute inset-0 bg-cyan-500/20 blur-xl rounded-full animate-pulse" />
+                <Loader2 className="relative w-16 h-16 text-cyan-400 animate-spin drop-shadow-[0_0_10px_rgba(34,211,238,0.5)]" />
               </div>
 
-              <div className="bg-black/60 rounded-lg p-4 border border-cyan-500/30">
-                <div className="text-[10px] text-slate-500 uppercase tracking-widest mb-2">Room Code</div>
-                <div className="text-3xl font-black text-cyan-400 font-mono mb-3">{sessionId}</div>
+              <div className="space-y-2">
+                <h2 className="text-xl font-bold text-cyan-400 uppercase tracking-widest drop-shadow-sm">Waiting for Opponent</h2>
+                <p className="text-xs text-slate-500 font-medium">Share this room code to start</p>
+              </div>
+
+              <div className="w-full bg-black/60 rounded-xl p-6 border border-cyan-500/20 shadow-[0_0_20px_rgba(0,0,0,0.3)] group relative overflow-hidden">
+                <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-cyan-500/50 to-transparent opacity-50" />
+                <div className="text-[10px] text-slate-500 uppercase tracking-[0.2em] mb-3 font-bold">Room Code</div>
+                <div className="text-4xl font-black text-cyan-400 font-mono mb-6 tracking-widest drop-shadow-[0_0_8px_rgba(34,211,238,0.3)] select-all">
+                  {sessionId}
+                </div>
                 <button
                   onClick={() => copyToClipboard(sessionId.toString())}
-                  className="w-full py-2 px-3 bg-cyan-500/20 hover:bg-cyan-500/30 rounded text-xs text-cyan-400 uppercase tracking-wide transition-colors flex items-center justify-center gap-2"
+                  className="w-full py-3 px-4 bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/30 rounded-lg text-xs font-bold text-cyan-400 uppercase tracking-wider transition-all flex items-center justify-center gap-2 group-hover:border-cyan-500/50"
                 >
                   {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-                  {copied ? 'Copied!' : 'Copy'}
+                  {copied ? 'Copied to Clipboard' : 'Copy Code'}
                 </button>
               </div>
 
-              <ActionButton
-                label="Cancel"
-                onClick={handleStartNewGame}
-                variant="default"
-                fullWidth
-              />
+              <div className="w-full pt-4">
+                <ActionButton
+                  label="Cancel Lobby"
+                  onClick={handleStartNewGame}
+                  variant="default"
+                  fullWidth
+                />
+              </div>
             </motion.div>
           </div>
         )}
 
         {/* COMMIT PHASE */}
         {gamePhase === 'commit' && (
-          <div className="flex-1 flex items-center justify-center p-8">
+          <div className="flex-1 flex flex-col items-center justify-center p-8 pb-20">
             <motion.div
-              initial={{ opacity: 0, scale: 0.9 }}
+              initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
-              className="text-center space-y-6"
+              className="w-full max-w-xs text-center flex flex-col items-center gap-10"
             >
-              <div className="w-16 h-16 mx-auto border-2 border-purple-500/50 rounded-full flex items-center justify-center">
-                <Target className="w-8 h-8 text-purple-400" />
+              <div className="relative">
+                <div className="absolute inset-0 bg-purple-500/20 blur-2xl rounded-full" />
+                <div className="relative w-24 h-24 mx-auto border-2 border-purple-500/50 rounded-full flex items-center justify-center bg-black/40 shadow-[0_0_30px_rgba(168,85,247,0.2)]">
+                  <Target className="w-10 h-10 text-purple-400 drop-shadow-[0_0_8px_rgba(192,132,252,0.6)]" />
+                </div>
               </div>
-              <div>
-                <h2 className="text-lg font-bold text-purple-400 uppercase tracking-widest">Set Drop Location</h2>
-                <p className="text-xs text-slate-500 mt-2">Your secret coordinates will be encrypted</p>
+
+              <div className="space-y-3">
+                <h2 className="text-2xl font-black text-purple-400 uppercase tracking-widest drop-shadow-sm">Set Location</h2>
+                <div className="h-px w-16 bg-purple-500/30 mx-auto" />
+                <p className="text-xs text-slate-400 max-w-[200px] mx-auto leading-relaxed">
+                  Your coordinates will be cryptographically secured.
+                </p>
               </div>
-              <ActionButton
-                label="Lock Coordinates"
-                onClick={handleCommitSecret}
-                loading={loading}
-                variant="primary"
-                icon={<Target className="w-4 h-4" />}
-              />
+
+              <div className="w-full">
+                <div className="p-4 bg-purple-900/10 border border-purple-500/10 rounded-xl mb-6">
+                  <p className="text-[10px] text-purple-300/70 uppercase tracking-wider font-medium">
+                    Status: <span className="text-purple-400 font-bold ml-1">UNSECURED</span>
+                  </p>
+                </div>
+
+                <ActionButton
+                  label="Lock Coordinates"
+                  onClick={handleCommitSecret}
+                  loading={loading}
+                  variant="primary"
+                  icon={<Target className="w-4 h-4" />}
+                  fullWidth
+                />
+              </div>
             </motion.div>
           </div>
         )}
 
-        {/* WAITING */}
+        {/* WAITING COMMIT */}
         {gamePhase === 'waiting_commit' && (
-          <div className="flex-1 flex items-center justify-center p-8">
+          <div className="flex-1 flex flex-col items-center justify-center p-8 pb-20">
             <motion.div
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              className="text-center space-y-4"
+              className="text-center space-y-6"
             >
-              <Loader2 className="w-12 h-12 text-cyan-400 mx-auto animate-spin" />
-              <p className="text-sm text-cyan-400 uppercase tracking-widest">Waiting for opponent...</p>
+              <div className="relative">
+                <div className="absolute inset-0 bg-cyan-500/10 blur-xl rounded-full animate-pulse" />
+                <Loader2 className="relative w-14 h-14 text-cyan-400 mx-auto animate-spin" />
+              </div>
+              <div className="space-y-2">
+                <p className="text-sm font-bold text-cyan-400 uppercase tracking-widest">Opponent committing...</p>
+                <p className="text-[10px] text-slate-500 uppercase tracking-wide">Secure link establishment in progress</p>
+              </div>
             </motion.div>
           </div>
         )}
 
         {/* MAIN GAMEPLAY */}
         {(gamePhase === 'my_turn' || gamePhase === 'opponent_turn') && (
-          <div className="flex-1 flex flex-col">
-            <div className="flex-1 relative">
-              <GameMap
-                pingHistory={pingHistory}
-                selectedCell={selectedCell}
-                onCellSelect={setSelectedCell}
-                interactive={gamePhase === 'my_turn'}
-                showDrop={showDebug}
-                dropCoords={getDropCoords()}
-              />
+          <div className="flex-1 flex flex-col h-full overflow-hidden">
+            <div className="flex-1 relative w-full h-full">
+              <div className="absolute inset-0">
+                <GameMap
+                  pingHistory={pingHistory}
+                  selectedCell={selectedCell}
+                  onCellSelect={setSelectedCell}
+                  interactive={gamePhase === 'my_turn'}
+                  showDrop={showDebug}
+                  dropCoords={getDropCoords()}
+                  userAddress={userAddress}
+                />
+              </div>
 
-              {/* Turn indicator */}
+              {/* Turn indicator overlay */}
               <AnimatePresence>
                 {gamePhase === 'opponent_turn' && (
                   <motion.div
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="absolute inset-0 bg-black/50 flex items-center justify-center"
+                    initial={{ opacity: 0, backdropFilter: "blur(0px)" }}
+                    animate={{ opacity: 1, backdropFilter: "blur(2px)" }}
+                    exit={{ opacity: 0, backdropFilter: "blur(0px)" }}
+                    className="absolute inset-0 bg-black/40 z-20 flex flex-col items-center justify-center pointer-events-none"
                   >
-                    <div className="text-center">
-                      <Loader2 className="w-8 h-8 text-slate-400 mx-auto animate-spin mb-2" />
-                      <p className="text-sm text-slate-400 uppercase tracking-widest">Opponent's turn</p>
+                    <div className="bg-black/80 border border-slate-700/50 px-6 py-4 rounded-xl flex flex-col items-center gap-3 backdrop-blur-md shadow-2xl">
+                      <Loader2 className="w-8 h-8 text-slate-400 animate-spin" />
+                      <p className="text-xs font-bold text-slate-300 uppercase tracking-widest">Opponent's turn</p>
                     </div>
                   </motion.div>
                 )}
               </AnimatePresence>
             </div>
 
-            {/* Action bar */}
-            {gamePhase === 'my_turn' && selectedCell && (
-              <motion.div
-                initial={{ y: 100 }}
-                animate={{ y: 0 }}
-                className="p-4 bg-black/60 border-t border-emerald-500/20"
-              >
-                <div className="flex items-center gap-3">
-                  <div className="flex-1">
-                    <span className="text-[10px] text-slate-500 uppercase block">Target</span>
-                    <span className="text-lg font-bold text-emerald-400 font-mono">
-                      {formatLatLng(gridToLatLng(selectedCell.x, selectedCell.y).lat, gridToLatLng(selectedCell.x, selectedCell.y).lng)}
-                    </span>
+            {/* Action bar - Fixed at bottom of game area */}
+            <AnimatePresence>
+              {gamePhase === 'my_turn' && selectedCell && (
+                <motion.div
+                  initial={{ y: "100%" }}
+                  animate={{ y: 0 }}
+                  exit={{ y: "100%" }}
+                  transition={{ type: "spring", stiffness: 300, damping: 30 }}
+                  className="z-30 bg-black/90 border-t border-emerald-500/30 backdrop-blur-xl pb-safe"
+                >
+                  <div className="p-4 space-y-3">
+                    <div className="flex items-end justify-between px-1">
+                      <div>
+                        <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold block mb-1">Target Coordinates</span>
+                        <span className="text-xl font-mono font-bold text-emerald-400 tracking-tight flex items-baseline gap-2">
+                          {formatLatLng(gridToLatLng(selectedCell.x, selectedCell.y).lat, gridToLatLng(selectedCell.x, selectedCell.y).lng)}
+                        </span>
+                      </div>
+                      <div className="text-right">
+                        <span className="text-[10px] text-emerald-500/70 uppercase tracking-widest font-bold">Ready</span>
+                      </div>
+                    </div>
+
+                    <ActionButton
+                      label="INITIATE PING"
+                      onClick={handleSubmitPing}
+                      loading={loading}
+                      variant="primary"
+                      icon={<Crosshair className="w-5 h-5" />}
+                      fullWidth
+                    />
                   </div>
-                  <ActionButton
-                    label="PING"
-                    onClick={handleSubmitPing}
-                    loading={loading}
-                    variant="primary"
-                    icon={<Crosshair className="w-4 h-4" />}
-                  />
-                </div>
-              </motion.div>
-            )}
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
         )}
 
         {/* GAME OVER (map still visible) */}
         {gamePhase === 'game_over' && (
-          <div className="flex-1 relative">
-            <GameMap
-              pingHistory={pingHistory}
-              selectedCell={null}
-              onCellSelect={() => { }}
-              interactive={false}
-              showDrop={true}
-              dropCoords={getDropCoords()}
-            />
+          <div className="flex-1 relative w-full h-full">
+            <div className="absolute inset-0 grayscale-[50%]">
+              <GameMap
+                pingHistory={pingHistory}
+                selectedCell={null}
+                onCellSelect={() => { }}
+                interactive={false}
+                showDrop={true}
+                dropCoords={getDropCoords()}
+                userAddress={userAddress}
+              />
+            </div>
+            <div className="absolute inset-0 bg-black/60 pointer-events-none" />
           </div>
         )}
       </div>
 
       {/* MODALS */}
-      <Modal isOpen={showHistoryModal} onClose={() => setShowHistoryModal(false)} title="Ping History">
-        {pingHistory.length === 0 ? (
-          <p className="text-center text-slate-500 py-8">No pings yet</p>
-        ) : (
-          <div className="space-y-2">
-            {pingHistory.map((ping, i) => (
-              <div key={i} className="flex items-center justify-between p-2 bg-black/30 rounded">
-                <span className="text-xs text-slate-400">Turn {ping.turn}</span>
-                <span className={`text-sm font-bold ${getZoneColor(ping.zone)}`}>{ping.zone}</span>
-                <span className="text-xs text-slate-500">{ping.distance}m</span>
-              </div>
-            ))}
-          </div>
-        )}
+      <Modal isOpen={showHistoryModal} onClose={() => setShowHistoryModal(false)} title="Mission Log">
+        <div className="max-h-[60vh] overflow-y-auto pr-2 -mr-2 spy-scrollbar">
+          {pingHistory.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12 text-slate-600 gap-3">
+              <History className="w-8 h-8 opacity-50" />
+              <p className="text-xs uppercase tracking-widest">No activity recorded</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {[...pingHistory].reverse().map((ping, i) => {
+                const isMe = ping.player === userAddress;
+                return (
+                  <div key={i} className={`flex items-center justify-between p-3 border rounded-lg transition-colors ${isMe ? 'bg-emerald-500/5 border-emerald-500/15 hover:bg-emerald-500/10' : 'bg-amber-500/5 border-amber-500/15 hover:bg-amber-500/10'}`}>
+                    <div className="flex flex-col gap-0.5">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] text-slate-500 uppercase tracking-wide font-bold">Turn {ping.turn}</span>
+                        <span className={`text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded ${isMe ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
+                          {isMe ? 'You' : 'Opp'}
+                        </span>
+                      </div>
+                      <span className="font-mono text-xs text-slate-300">
+                        {formatLatLng(gridToLatLng(ping.x, ping.y).lat, gridToLatLng(ping.x, ping.y).lng)}
+                      </span>
+                    </div>
+                    <div className="text-right">
+                      <span className={`block text-xs font-bold uppercase tracking-wider mb-0.5 ${getZoneColor(ping.zone)} drop-shadow-sm`}>
+                        {ping.zone}
+                      </span>
+                      <span className="text-[10px] text-slate-500 font-mono">{ping.distance}m</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </Modal>
 
       <Modal isOpen={showInfoModal} onClose={() => setShowInfoModal(false)} title="Game Info">
@@ -817,7 +977,7 @@ export function DeadDropGame({
           {/* Dev mode toggle */}
           <div className="pt-4 border-t border-slate-700">
             <button
-              onClick={() => { setShowDebug(!showDebug); showToast(showDebug ? 'Debug off' : 'Debug on', 'info'); }}
+              onClick={() => { setShowDebug(!showDebug); showToast(showDebug ? 'Debug disabled' : 'Debug enabled', 'info', 1000); }}
               className="w-full py-2 text-xs text-slate-500 hover:text-red-400 transition-colors"
             >
               {showDebug ? 'Disable' : 'Enable'} Debug Mode
@@ -856,7 +1016,7 @@ export function DeadDropGame({
         </div>
       </Modal>
 
-      <ToastSystem toast={toast} onDismiss={() => setToast(null)} />
+      <ToastSystem toast={toast} onDismiss={handleDismissToast} />
     </div>
   );
 }

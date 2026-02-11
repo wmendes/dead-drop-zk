@@ -1,6 +1,6 @@
-import { Client as DeadDropClient, type Game } from './bindings';
+import { Client as DeadDropClient, type Game, type Lobby } from './bindings';
 import { NETWORK_PASSPHRASE, RPC_URL, DEFAULT_METHOD_OPTIONS, DEFAULT_AUTH_TTL_MINUTES, MULTI_SIG_AUTH_TTL_MINUTES } from '@/utils/constants';
-import { contract, TransactionBuilder, StrKey, xdr, Address, authorizeEntry } from '@stellar/stellar-sdk';
+import { contract, TransactionBuilder, StrKey, xdr, Address, authorizeEntry, rpc } from '@stellar/stellar-sdk';
 import { Buffer } from 'buffer';
 import { signAndSendViaLaunchtube } from '@/utils/transactionHelper';
 import { calculateValidUntilLedger } from '@/utils/ledgerUtils';
@@ -51,6 +51,19 @@ export class DeadDropService {
   async getGame(sessionId: number): Promise<Game | null> {
     try {
       const tx = await this.baseClient.get_game({ session_id: sessionId });
+      const result = await tx.simulate();
+      if (result.result.isOk()) {
+        return result.result.unwrap();
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  async getLobby(sessionId: number): Promise<Lobby | null> {
+    try {
+      const tx = await this.baseClient.get_lobby({ session_id: sessionId });
       const result = await tx.simulate();
       if (result.result.isOk()) {
         return result.result.unwrap();
@@ -326,6 +339,46 @@ export class DeadDropService {
   }
 
   // ========================================================================
+  // Single-sig lobby actions
+  // ========================================================================
+
+  async openGame(
+    sessionId: number,
+    hostAddress: string,
+    hostPoints: bigint,
+    signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>
+  ) {
+    const client = this.createSigningClient(hostAddress, signer);
+    const tx = await client.open_game({
+      session_id: sessionId,
+      host: hostAddress,
+      host_points: hostPoints,
+    }, DEFAULT_METHOD_OPTIONS);
+
+    const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
+    const sentTx = await signAndSendViaLaunchtube(tx, DEFAULT_METHOD_OPTIONS.timeoutInSeconds, validUntilLedgerSeq);
+    return sentTx.result;
+  }
+
+  async joinGame(
+    sessionId: number,
+    joinerAddress: string,
+    joinerPoints: bigint,
+    signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>
+  ) {
+    const client = this.createSigningClient(joinerAddress, signer);
+    const tx = await client.join_game({
+      session_id: sessionId,
+      joiner: joinerAddress,
+      joiner_points: joinerPoints,
+    }, DEFAULT_METHOD_OPTIONS);
+
+    const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
+    const sentTx = await signAndSendViaLaunchtube(tx, DEFAULT_METHOD_OPTIONS.timeoutInSeconds, validUntilLedgerSeq);
+    return sentTx.result;
+  }
+
+  // ========================================================================
   // Single-sig game actions
   // ========================================================================
 
@@ -352,6 +405,8 @@ export class DeadDropService {
     playerAddress: string,
     turn: number,
     distance: number,
+    x: number,
+    y: number,
     journalHash: Buffer,
     imageId: Buffer,
     seal: Buffer,
@@ -363,6 +418,8 @@ export class DeadDropService {
       player: playerAddress,
       turn,
       distance,
+      x,
+      y,
       journal_hash: journalHash,
       image_id: imageId,
       seal,
@@ -380,6 +437,65 @@ export class DeadDropService {
         throw new Error('Transaction failed - check turn order and proof validity');
       }
       throw err;
+    }
+  }
+
+  async getPingEvents(sessionId: number): Promise<{
+    player: string, turn: number, distance: number, x: number, y: number,
+  }[]> {
+    try {
+      const server = new rpc.Server(RPC_URL);
+      const latest = await server.getLatestLedger();
+      const startLedger = Math.max(1, latest.sequence - 10000);
+
+      // Fetch ALL contract events without topic filter — server-side topic
+      // filtering is unreliable on the public testnet RPC. Filter client-side.
+      const events = await server.getEvents({
+        startLedger,
+        filters: [{ type: 'contract', contractIds: [this.contractId] }],
+        limit: 200,
+      });
+
+      console.log('getPingEvents raw:', events.events.length);
+
+      // Pre-compute expected topic XDRs for client-side matching
+      const expectedSymbol = xdr.ScVal.scvSymbol("ping").toXDR('base64');
+      const expectedSessionId = xdr.ScVal.scvU32(sessionId).toXDR('base64');
+
+      return events.events
+        .filter(event => {
+          try {
+            const t = event.topic;
+            if (!t || t.length < 2) return false;
+            // topic[0] must be Symbol("ping"), topic[1] must be our session_id
+            return t[0].toXDR('base64') === expectedSymbol
+                && t[1].toXDR('base64') === expectedSessionId;
+          } catch { return false; }
+        })
+        .map(event => {
+          try {
+            // event.value is already xdr.ScVal (not a base64 wrapper)
+            const val = event.value;
+            if (val.switch().name !== 'scvVec') return null;
+            const vec = val.vec();
+            if (!vec || vec.length < 5) return null;
+
+            const player   = Address.fromScVal(vec[0]).toString();
+            const turn     = vec[1].u32();
+            const distance = vec[2].u32();
+            const x        = vec[3].u32();
+            const y        = vec[4].u32();
+
+            return { player, turn, distance, x, y };
+          } catch (e) {
+            console.error('Failed to parse ping event', e);
+            return null;
+          }
+        })
+        .filter((e): e is { player: string, turn: number, distance: number, x: number, y: number } => e !== null);
+    } catch (err) {
+      console.error('getPingEvents error:', err);
+      return [];
     }
   }
 

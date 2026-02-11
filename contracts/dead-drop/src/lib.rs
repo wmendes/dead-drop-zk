@@ -57,6 +57,9 @@ pub enum Error {
     TimeoutNotReached = 11,
     InvalidDistance = 12,
     MaxTurnsReached = 13,
+    LobbyNotFound = 14,
+    LobbyAlreadyExists = 15,
+    SelfPlay = 16,
 }
 
 // ============================================================================
@@ -93,9 +96,18 @@ pub struct Game {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Lobby {
+    pub host: Address,
+    pub host_points: i128,
+    pub created_ledger: u32,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Game(u32),
+    Lobby(u32),
     GameHubAddress,
     Admin,
     VerifierId,
@@ -161,7 +173,7 @@ impl DeadDropContract {
     ) -> Result<(), Error> {
         // Prevent self-play
         if player1 == player2 {
-            panic!("Cannot play against yourself");
+            return Err(Error::SelfPlay);
         }
 
         // Require auth from both players for their points
@@ -282,6 +294,8 @@ impl DeadDropContract {
         player: Address,
         turn: u32,
         distance: u32,
+        x: u32,
+        y: u32,
         journal_hash: BytesN<32>,
         image_id: BytesN<32>,
         seal: Bytes,
@@ -359,6 +373,14 @@ impl DeadDropContract {
             .expect("VerifierId not set");
 
         verify_proof(&env, &verifier_addr, &journal_hash, &image_id, &seal);
+
+        // Emit ping event for frontend syncing
+        // Topic: ["ping", session_id]
+        // Data: [player, turn, distance, x, y]
+        env.events().publish(
+            (Symbol::new(&env, "ping"), session_id),
+            (player.clone(), turn, distance, x, y),
+        );
 
         // Record distance and update best
         if is_player1_turn {
@@ -494,6 +516,117 @@ impl DeadDropContract {
             .temporary()
             .get(&key)
             .ok_or(Error::GameNotFound)
+    }
+
+    /// Open a lobby for a game session. Player 1 creates it with a room code (session_id).
+    /// This is single-sig and does not require the opponent's address.
+    pub fn open_game(
+        env: Env,
+        session_id: u32,
+        host: Address,
+        host_points: i128,
+    ) -> Result<(), Error> {
+        host.require_auth_for_args(
+            vec![&env, session_id.into_val(&env), host_points.into_val(&env)],
+        );
+
+        // Reject if session slot is already in use
+        let lobby_key = DataKey::Lobby(session_id);
+        if env.storage().temporary().has(&lobby_key) {
+            return Err(Error::LobbyAlreadyExists);
+        }
+        let game_key = DataKey::Game(session_id);
+        if env.storage().temporary().has(&game_key) {
+            return Err(Error::LobbyAlreadyExists);
+        }
+
+        let lobby = Lobby {
+            host,
+            host_points,
+            created_ledger: env.ledger().sequence(),
+        };
+        env.storage().temporary().set(&lobby_key, &lobby);
+        env.storage()
+            .temporary()
+            .extend_ttl(&lobby_key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
+
+        Ok(())
+    }
+
+    /// Join an existing lobby. Player 2 joins with the room code (session_id).
+    /// This is single-sig and calls Game Hub to start the game.
+    pub fn join_game(
+        env: Env,
+        session_id: u32,
+        joiner: Address,
+        joiner_points: i128,
+    ) -> Result<(), Error> {
+        joiner.require_auth_for_args(
+            vec![&env, session_id.into_val(&env), joiner_points.into_val(&env)],
+        );
+
+        let lobby_key = DataKey::Lobby(session_id);
+        let lobby: Lobby = env
+            .storage()
+            .temporary()
+            .get(&lobby_key)
+            .ok_or(Error::LobbyNotFound)?;
+
+        if joiner == lobby.host {
+            return Err(Error::SelfPlay);
+        }
+
+        // Consume the lobby
+        env.storage().temporary().remove(&lobby_key);
+
+        // Now both players are known — call Game Hub
+        let hub_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GameHubAddress)
+            .expect("GameHub address not set");
+        let game_hub = GameHubClient::new(&env, &hub_addr);
+        game_hub.start_game(
+            &env.current_contract_address(),
+            &session_id,
+            &lobby.host,
+            &joiner,
+            &lobby.host_points,
+            &joiner_points,
+        );
+
+        // Create the game
+        let game = Game {
+            player1: lobby.host,
+            player2: joiner,
+            player1_points: lobby.host_points,
+            player2_points: joiner_points,
+            commitment1: BytesN::from_array(&env, &EMPTY_COMMITMENT),
+            commitment2: BytesN::from_array(&env, &EMPTY_COMMITMENT),
+            status: GameStatus::Created,
+            current_turn: 0,
+            whose_turn: 1,
+            player1_best_distance: NO_DISTANCE,
+            player2_best_distance: NO_DISTANCE,
+            winner: None,
+            last_action_ledger: env.ledger().sequence(),
+        };
+
+        let game_key = DataKey::Game(session_id);
+        env.storage().temporary().set(&game_key, &game);
+        env.storage()
+            .temporary()
+            .extend_ttl(&game_key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
+
+        Ok(())
+    }
+
+    /// Read-only lobby state query.
+    pub fn get_lobby(env: Env, session_id: u32) -> Result<Lobby, Error> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::Lobby(session_id))
+            .ok_or(Error::LobbyNotFound)
     }
 
     // ========================================================================

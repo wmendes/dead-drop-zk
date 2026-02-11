@@ -23,6 +23,7 @@
     "react-leaflet": "^5.0.0",
     "sac-sdk": "^0.4.2",
     "tailwind-merge": "^3.4.0",
+    "tone": "^15.1.22",
     "zustand": "^5.0.9"
   },
   "devDependencies": {

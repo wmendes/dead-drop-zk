@@ -4,13 +4,20 @@
 
 .studio {
   position: relative;
-  min-height: 100vh;
+  height: 100dvh;
+  /* Full viewport height */
   display: flex;
   flex-direction: column;
   color: var(--spy-terminal-green);
   background: #020617;
   overflow: hidden;
+  /* Prevent body scrolling */
   font-family: var(--font-mono);
+}
+
+/* When inside the phone frame, use 100% height to fill the frame */
+.phone-screen .studio {
+  height: 100%;
 }
 
 /* Background — subtle grid pattern like radar */
@@ -71,15 +78,7 @@
 
 /* Header — Terminal Bar */
 .studio-header {
-  max-width: 1200px;
-  margin: 0 auto;
-  width: 100%;
-  padding: 1rem 1.25rem 0.5rem;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  border-bottom: 1px solid rgba(74, 222, 128, 0.1);
+  display: none;
 }
 
 /* Brand — Spy Mission Header */
@@ -143,10 +142,18 @@
   width: 100%;
   padding: 0 1rem 2rem;
   flex: 1;
+  overflow-y: auto;
+  /* Enable internal scrolling */
+  -webkit-overflow-scrolling: touch;
 }
 
 /* Footer — System Info Line */
 .studio-footer {
+  /* Hide original footer or repurposed? Let's hide it for now to avoid clutter, or maybe keep it but different style? 
+     The request implies replacing header with footer menu. 
+     Let's keep the original footer as "System Info" but maybe push it up or hide it. 
+     Actually, let's leave it as is, but ensure padding-bottom on main is enough.
+  */
   max-width: 1200px;
   margin: 0 auto 0.5rem;
   width: 100%;
@@ -160,6 +167,68 @@
   letter-spacing: 0.1em;
   font-family: var(--font-mono);
   text-transform: uppercase;
+  padding-bottom: 80px;
+  /* Space for fixed footer menu */
+}
+
+/* Fixed Bottom Menu */
+.studio-footer-menu {
+  /* Remove fixed positioning to be part of flex layout */
+  position: relative;
+  width: 100%;
+  height: 64px;
+  display: flex;
+  z-index: 100;
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.5);
+  background: #020617;
+  border-top: 1px solid rgba(74, 222, 128, 0.2);
+  flex-shrink: 0;
+  /* Don't shrink */
+}
+
+.player-switch-button {
+  flex: 1;
+  border: none;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+}
+
+.player-switch-button:active {
+  transform: translateY(2px);
+}
+
+.player-switch-button.p1 {
+  background: #fbbf24;
+  /* amber-400 */
+  color: #451a03;
+}
+
+.player-switch-button.p1:hover {
+  background: #fcd34d;
+}
+
+.player-switch-button.p2 {
+  background: #ef4444;
+  /* red-500 */
+  color: #fff;
+}
+
+.player-switch-button.p2:hover {
+  background: #f87171;
+}
+
+.player-switch-button.active {
+  box-shadow: inset 0 0 0 4px rgba(0, 0, 0, 0.4);
+  filter: brightness(0.9);
 }
 
 @keyframes float {

@@ -34,7 +34,7 @@ if (typeof window !== "undefined") {
 export const networks = {
   testnet: {
     networkPassphrase: "Test SDF Network ; September 2015",
-    contractId: "CADRFTQJ4BH5SSYZ2YYS6GCIFE5V4M372ZH2AXGIVQTY2UGC6YC43IL5",
+    contractId: "CCMKJGCCNCUFPPDBFIVF6TMFGF5N6KEAHORXDTS7VZKPUIFBAIUJLB34",
   }
 } as const
 
@@ -68,10 +68,20 @@ export const Errors = {
   10: {message:"ProofVerificationFailed"},
   11: {message:"TimeoutNotReached"},
   12: {message:"InvalidDistance"},
-  13: {message:"MaxTurnsReached"}
+  13: {message:"MaxTurnsReached"},
+  14: {message:"LobbyNotFound"},
+  15: {message:"LobbyAlreadyExists"},
+  16: {message:"SelfPlay"}
 }
 
-export type DataKey = {tag: "Game", values: readonly [u32]} | {tag: "GameHubAddress", values: void} | {tag: "Admin", values: void} | {tag: "VerifierId", values: void} | {tag: "PingImageId", values: void};
+
+export interface Lobby {
+  created_ledger: u32;
+  host: string;
+  host_points: i128;
+}
+
+export type DataKey = {tag: "Game", values: readonly [u32]} | {tag: "Lobby", values: readonly [u32]} | {tag: "GameHubAddress", values: void} | {tag: "Admin", values: void} | {tag: "VerifierId", values: void} | {tag: "PingImageId", values: void};
 
 export enum GameStatus {
   Created = 0,
@@ -109,6 +119,26 @@ export interface Client {
   get_admin: (options?: MethodOptions) => Promise<AssembledTransaction<string>>
 
   /**
+   * Construct and simulate a get_lobby transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Read-only lobby state query.
+   */
+  get_lobby: ({session_id}: {session_id: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Lobby>>>
+
+  /**
+   * Construct and simulate a join_game transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Join an existing lobby. Player 2 joins with the room code (session_id).
+   * This is single-sig and calls Game Hub to start the game.
+   */
+  join_game: ({session_id, joiner, joiner_points}: {session_id: u32, joiner: string, joiner_points: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a open_game transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Open a lobby for a game session. Player 1 creates it with a room code (session_id).
+   * This is single-sig and does not require the opponent's address.
+   */
+  open_game: ({session_id, host, host_points}: {session_id: u32, host: string, host_points: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
    * Construct and simulate a set_admin transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    */
   set_admin: ({new_admin}: {new_admin: string}, options?: MethodOptions) => Promise<AssembledTransaction<null>>
@@ -129,7 +159,7 @@ export interface Client {
    * 
    * Journal layout: [session_id(4) || turn(4) || distance(4) || commitment(32)] = 44 bytes LE
    */
-  submit_ping: ({session_id, player, turn, distance, journal_hash, image_id, seal}: {session_id: u32, player: string, turn: u32, distance: u32, journal_hash: Buffer, image_id: Buffer, seal: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Option<string>>>>
+  submit_ping: ({session_id, player, turn, distance, x, y, journal_hash, image_id, seal}: {session_id: u32, player: string, turn: u32, distance: u32, x: u32, y: u32, journal_hash: Buffer, image_id: Buffer, seal: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Option<string>>>>
 
   /**
    * Construct and simulate a set_image_id transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -175,17 +205,21 @@ export class Client extends ContractClient {
   constructor(public readonly options: ContractClientOptions) {
     super(
       new ContractSpec([ "AAAAAQAAAAAAAAAAAAAABEdhbWUAAAANAAAAAAAAAAtjb21taXRtZW50MQAAAAPuAAAAIAAAAAAAAAALY29tbWl0bWVudDIAAAAD7gAAACAAAAAAAAAADGN1cnJlbnRfdHVybgAAAAQAAAAAAAAAEmxhc3RfYWN0aW9uX2xlZGdlcgAAAAAABAAAAAAAAAAHcGxheWVyMQAAAAATAAAAAAAAABVwbGF5ZXIxX2Jlc3RfZGlzdGFuY2UAAAAAAAAEAAAAAAAAAA5wbGF5ZXIxX3BvaW50cwAAAAAACwAAAAAAAAAHcGxheWVyMgAAAAATAAAAAAAAABVwbGF5ZXIyX2Jlc3RfZGlzdGFuY2UAAAAAAAAEAAAAAAAAAA5wbGF5ZXIyX3BvaW50cwAAAAAACwAAAAAAAAAGc3RhdHVzAAAAAAfQAAAACkdhbWVTdGF0dXMAAAAAAAAAAAAKd2hvc2VfdHVybgAAAAAABAAAAAAAAAAGd2lubmVyAAAAAAPoAAAAEw==",
-        "AAAABAAAAAAAAAAAAAAABUVycm9yAAAAAAAADQAAAAAAAAAMR2FtZU5vdEZvdW5kAAAAAQAAAAAAAAAJTm90UGxheWVyAAAAAAAAAgAAAAAAAAAQR2FtZUFscmVhZHlFbmRlZAAAAAMAAAAAAAAAEUludmFsaWRHYW1lU3RhdHVzAAAAAAAABAAAAAAAAAAQQWxyZWFkeUNvbW1pdHRlZAAAAAUAAAAAAAAAC05vdFlvdXJUdXJuAAAAAAYAAAAAAAAAC0ludmFsaWRUdXJuAAAAAAcAAAAAAAAADkludmFsaWRJbWFnZUlkAAAAAAAIAAAAAAAAABJJbnZhbGlkSm91cm5hbEhhc2gAAAAAAAkAAAAAAAAAF1Byb29mVmVyaWZpY2F0aW9uRmFpbGVkAAAAAAoAAAAAAAAAEVRpbWVvdXROb3RSZWFjaGVkAAAAAAAACwAAAAAAAAAPSW52YWxpZERpc3RhbmNlAAAAAAwAAAAAAAAAD01heFR1cm5zUmVhY2hlZAAAAAAN",
-        "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAABQAAAAEAAAAAAAAABEdhbWUAAAABAAAABAAAAAAAAAAAAAAADkdhbWVIdWJBZGRyZXNzAAAAAAAAAAAAAAAAAAVBZG1pbgAAAAAAAAAAAAAAAAAAClZlcmlmaWVySWQAAAAAAAAAAAAAAAAAC1BpbmdJbWFnZUlkAA==",
+        "AAAABAAAAAAAAAAAAAAABUVycm9yAAAAAAAAEAAAAAAAAAAMR2FtZU5vdEZvdW5kAAAAAQAAAAAAAAAJTm90UGxheWVyAAAAAAAAAgAAAAAAAAAQR2FtZUFscmVhZHlFbmRlZAAAAAMAAAAAAAAAEUludmFsaWRHYW1lU3RhdHVzAAAAAAAABAAAAAAAAAAQQWxyZWFkeUNvbW1pdHRlZAAAAAUAAAAAAAAAC05vdFlvdXJUdXJuAAAAAAYAAAAAAAAAC0ludmFsaWRUdXJuAAAAAAcAAAAAAAAADkludmFsaWRJbWFnZUlkAAAAAAAIAAAAAAAAABJJbnZhbGlkSm91cm5hbEhhc2gAAAAAAAkAAAAAAAAAF1Byb29mVmVyaWZpY2F0aW9uRmFpbGVkAAAAAAoAAAAAAAAAEVRpbWVvdXROb3RSZWFjaGVkAAAAAAAACwAAAAAAAAAPSW52YWxpZERpc3RhbmNlAAAAAAwAAAAAAAAAD01heFR1cm5zUmVhY2hlZAAAAAANAAAAAAAAAA1Mb2JieU5vdEZvdW5kAAAAAAAADgAAAAAAAAASTG9iYnlBbHJlYWR5RXhpc3RzAAAAAAAPAAAAAAAAAAhTZWxmUGxheQAAABA=",
+        "AAAAAQAAAAAAAAAAAAAABUxvYmJ5AAAAAAAAAwAAAAAAAAAOY3JlYXRlZF9sZWRnZXIAAAAAAAQAAAAAAAAABGhvc3QAAAATAAAAAAAAAAtob3N0X3BvaW50cwAAAAAL",
+        "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAABgAAAAEAAAAAAAAABEdhbWUAAAABAAAABAAAAAEAAAAAAAAABUxvYmJ5AAAAAAAAAQAAAAQAAAAAAAAAAAAAAA5HYW1lSHViQWRkcmVzcwAAAAAAAAAAAAAAAAAFQWRtaW4AAAAAAAAAAAAAAAAAAApWZXJpZmllcklkAAAAAAAAAAAAAAAAAAtQaW5nSW1hZ2VJZAA=",
         "AAAAAwAAAAAAAAAAAAAACkdhbWVTdGF0dXMAAAAAAAUAAAAAAAAAB0NyZWF0ZWQAAAAAAAAAAAAAAAAKQ29tbWl0dGluZwAAAAAAAQAAAAAAAAAGQWN0aXZlAAAAAAACAAAAAAAAAAlDb21wbGV0ZWQAAAAAAAADAAAAAAAAAAdUaW1lb3V0AAAAAAQ=",
         "AAAAAAAAAAAAAAAHZ2V0X2h1YgAAAAAAAAAAAQAAABM=",
         "AAAAAAAAAAAAAAAHc2V0X2h1YgAAAAABAAAAAAAAAAduZXdfaHViAAAAABMAAAAA",
         "AAAAAAAAAAAAAAAHdXBncmFkZQAAAAABAAAAAAAAAA1uZXdfd2FzbV9oYXNoAAAAAAAD7gAAACAAAAAA",
         "AAAAAAAAABtSZWFkLW9ubHkgZ2FtZSBzdGF0ZSBxdWVyeS4AAAAACGdldF9nYW1lAAAAAQAAAAAAAAAKc2Vzc2lvbl9pZAAAAAAABAAAAAEAAAPpAAAH0AAAAARHYW1lAAAAAw==",
         "AAAAAAAAAAAAAAAJZ2V0X2FkbWluAAAAAAAAAAAAAAEAAAAT",
+        "AAAAAAAAABxSZWFkLW9ubHkgbG9iYnkgc3RhdGUgcXVlcnkuAAAACWdldF9sb2JieQAAAAAAAAEAAAAAAAAACnNlc3Npb25faWQAAAAAAAQAAAABAAAD6QAAB9AAAAAFTG9iYnkAAAAAAAAD",
+        "AAAAAAAAAIBKb2luIGFuIGV4aXN0aW5nIGxvYmJ5LiBQbGF5ZXIgMiBqb2lucyB3aXRoIHRoZSByb29tIGNvZGUgKHNlc3Npb25faWQpLgpUaGlzIGlzIHNpbmdsZS1zaWcgYW5kIGNhbGxzIEdhbWUgSHViIHRvIHN0YXJ0IHRoZSBnYW1lLgAAAAlqb2luX2dhbWUAAAAAAAADAAAAAAAAAApzZXNzaW9uX2lkAAAAAAAEAAAAAAAAAAZqb2luZXIAAAAAABMAAAAAAAAADWpvaW5lcl9wb2ludHMAAAAAAAALAAAAAQAAA+kAAAACAAAAAw==",
+        "AAAAAAAAAJNPcGVuIGEgbG9iYnkgZm9yIGEgZ2FtZSBzZXNzaW9uLiBQbGF5ZXIgMSBjcmVhdGVzIGl0IHdpdGggYSByb29tIGNvZGUgKHNlc3Npb25faWQpLgpUaGlzIGlzIHNpbmdsZS1zaWcgYW5kIGRvZXMgbm90IHJlcXVpcmUgdGhlIG9wcG9uZW50J3MgYWRkcmVzcy4AAAAACW9wZW5fZ2FtZQAAAAAAAAMAAAAAAAAACnNlc3Npb25faWQAAAAAAAQAAAAAAAAABGhvc3QAAAATAAAAAAAAAAtob3N0X3BvaW50cwAAAAALAAAAAQAAA+kAAAACAAAAAw==",
         "AAAAAAAAAAAAAAAJc2V0X2FkbWluAAAAAAAAAQAAAAAAAAAJbmV3X2FkbWluAAAAAAAAEwAAAAA=",
         "AAAAAAAAAC1TdGFydCBhIG5ldyBnYW1lIHNlc3Npb24gYmV0d2VlbiB0d28gcGxheWVycy4AAAAAAAAKc3RhcnRfZ2FtZQAAAAAABQAAAAAAAAAKc2Vzc2lvbl9pZAAAAAAABAAAAAAAAAAHcGxheWVyMQAAAAATAAAAAAAAAAdwbGF5ZXIyAAAAABMAAAAAAAAADnBsYXllcjFfcG9pbnRzAAAAAAALAAAAAAAAAA5wbGF5ZXIyX3BvaW50cwAAAAAACwAAAAEAAAPpAAAAAgAAAAM=",
-        "AAAAAAAAAU9TdWJtaXQgYSBwaW5nIHJlc3VsdCB3aXRoIFpLIHByb29mIHZlcmlmaWNhdGlvbi4KClRoZSBwaW5naW5nIHBsYXllciBzZW5kcyBhIGNvb3JkaW5hdGUgdG8gdGhlIHJlc3BvbmRlciBvZmYtY2hhaW4uClRoZSByZXNwb25kZXIgY29tcHV0ZXMgdGhlIE1hbmhhdHRhbiBkaXN0YW5jZSBhbmQgZ2VuZXJhdGVzIGEgWksgcHJvb2YuClRoaXMgbWV0aG9kIHZlcmlmaWVzIHRoZSBwcm9vZiBhbmQgcmVjb3JkcyB0aGUgZGlzdGFuY2UuCgpKb3VybmFsIGxheW91dDogW3Nlc3Npb25faWQoNCkgfHwgdHVybig0KSB8fCBkaXN0YW5jZSg0KSB8fCBjb21taXRtZW50KDMyKV0gPSA0NCBieXRlcyBMRQAAAAALc3VibWl0X3BpbmcAAAAABwAAAAAAAAAKc2Vzc2lvbl9pZAAAAAAABAAAAAAAAAAGcGxheWVyAAAAAAATAAAAAAAAAAR0dXJuAAAABAAAAAAAAAAIZGlzdGFuY2UAAAAEAAAAAAAAAAxqb3VybmFsX2hhc2gAAAPuAAAAIAAAAAAAAAAIaW1hZ2VfaWQAAAPuAAAAIAAAAAAAAAAEc2VhbAAAAA4AAAABAAAD6QAAA+gAAAATAAAAAw==",
+        "AAAAAAAAAU9TdWJtaXQgYSBwaW5nIHJlc3VsdCB3aXRoIFpLIHByb29mIHZlcmlmaWNhdGlvbi4KClRoZSBwaW5naW5nIHBsYXllciBzZW5kcyBhIGNvb3JkaW5hdGUgdG8gdGhlIHJlc3BvbmRlciBvZmYtY2hhaW4uClRoZSByZXNwb25kZXIgY29tcHV0ZXMgdGhlIE1hbmhhdHRhbiBkaXN0YW5jZSBhbmQgZ2VuZXJhdGVzIGEgWksgcHJvb2YuClRoaXMgbWV0aG9kIHZlcmlmaWVzIHRoZSBwcm9vZiBhbmQgcmVjb3JkcyB0aGUgZGlzdGFuY2UuCgpKb3VybmFsIGxheW91dDogW3Nlc3Npb25faWQoNCkgfHwgdHVybig0KSB8fCBkaXN0YW5jZSg0KSB8fCBjb21taXRtZW50KDMyKV0gPSA0NCBieXRlcyBMRQAAAAALc3VibWl0X3BpbmcAAAAACQAAAAAAAAAKc2Vzc2lvbl9pZAAAAAAABAAAAAAAAAAGcGxheWVyAAAAAAATAAAAAAAAAAR0dXJuAAAABAAAAAAAAAAIZGlzdGFuY2UAAAAEAAAAAAAAAAF4AAAAAAAABAAAAAAAAAABeQAAAAAAAAQAAAAAAAAADGpvdXJuYWxfaGFzaAAAA+4AAAAgAAAAAAAAAAhpbWFnZV9pZAAAA+4AAAAgAAAAAAAAAARzZWFsAAAADgAAAAEAAAPpAAAD6AAAABMAAAAD",
         "AAAAAAAAAAAAAAAMc2V0X2ltYWdlX2lkAAAAAQAAAAAAAAAMbmV3X2ltYWdlX2lkAAAD7gAAACAAAAAA",
         "AAAAAAAAAAAAAAAMc2V0X3ZlcmlmaWVyAAAAAQAAAAAAAAAMbmV3X3ZlcmlmaWVyAAAAEwAAAAA=",
         "AAAAAAAAABhJbml0aWFsaXplIHRoZSBjb250cmFjdC4AAAANX19jb25zdHJ1Y3RvcgAAAAAAAAQAAAAAAAAABWFkbWluAAAAAAAAEwAAAAAAAAAIZ2FtZV9odWIAAAATAAAAAAAAAAt2ZXJpZmllcl9pZAAAAAATAAAAAAAAAA1waW5nX2ltYWdlX2lkAAAAAAAD7gAAACAAAAAA",
@@ -200,6 +234,9 @@ export class Client extends ContractClient {
         upgrade: this.txFromJSON<null>,
         get_game: this.txFromJSON<Result<Game>>,
         get_admin: this.txFromJSON<string>,
+        get_lobby: this.txFromJSON<Result<Lobby>>,
+        join_game: this.txFromJSON<Result<void>>,
+        open_game: this.txFromJSON<Result<void>>,
         set_admin: this.txFromJSON<null>,
         start_game: this.txFromJSON<Result<void>>,
         submit_ping: this.txFromJSON<Result<Option<string>>>,

@@ -12,6 +12,7 @@ interface PingResult {
   y: number;
   distance: number;
   zone: TemperatureZone;
+  player: string;
 }
 
 function getZoneColor(zone: TemperatureZone): string {
@@ -91,9 +92,10 @@ interface GameMapProps {
   interactive: boolean;
   showDrop?: boolean;
   dropCoords?: { x: number; y: number } | null;
+  userAddress?: string;
 }
 
-export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, showDrop, dropCoords }: GameMapProps) {
+export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, showDrop, dropCoords, userAddress }: GameMapProps) {
   const handleCellSelect = useCallback((cell: { x: number; y: number }) => {
     if (interactive) onCellSelect(cell);
   }, [interactive, onCellSelect]);
@@ -101,20 +103,22 @@ export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, 
   const pingMarkers = useMemo(() => pingHistory.map((ping, i) => {
     const pos = gridToLatLng(ping.x, ping.y);
     const color = getZoneColor(ping.zone);
+    const isMe = userAddress ? ping.player === userAddress : true;
     return (
       <CircleMarker
         key={`ping-${i}`}
         center={[pos.lat, pos.lng]}
         radius={6}
         pathOptions={{
-          color: 'rgba(255,255,255,0.8)',
-          weight: 1,
+          color: isMe ? 'rgba(255,255,255,0.9)' : 'rgba(251,191,36,0.9)',
+          weight: isMe ? 1 : 1.5,
           fillColor: color,
-          fillOpacity: 0.8,
+          fillOpacity: isMe ? 0.85 : 0.5,
+          dashArray: isMe ? undefined : '3, 3',
         }}
       />
     );
-  }), [pingHistory]);
+  }), [pingHistory, userAddress]);
 
   const selectedMarker = useMemo(() => {
     if (!selectedCell) return null;
@@ -174,7 +178,7 @@ export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, 
   }, [showDrop, dropCoords]);
 
   return (
-    <div className="relative spy-scanlines aspect-square w-full max-w-md mx-auto">
+    <div className="relative spy-scanlines w-full h-full">
       <div
         className={`
           rounded-xl overflow-hidden border transition-all duration-500 relative h-full w-full
