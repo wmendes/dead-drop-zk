@@ -5,6 +5,7 @@ import type { LeafletMouseEvent } from 'leaflet';
 const GRID_SIZE = 100;
 
 type TemperatureZone = 'FOUND' | 'HOT' | 'WARM' | 'COOL' | 'COLD';
+type CoordVisibility = 'exact' | 'unknown';
 
 interface PingResult {
   turn: number;
@@ -13,6 +14,7 @@ interface PingResult {
   distance: number;
   zone: TemperatureZone;
   player: string;
+  coordVisibility: CoordVisibility;
 }
 
 function getZoneColor(zone: TemperatureZone): string {
@@ -100,7 +102,9 @@ export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, 
     if (interactive) onCellSelect(cell);
   }, [interactive, onCellSelect]);
 
-  const pingMarkers = useMemo(() => pingHistory.map((ping, i) => {
+  const pingMarkers = useMemo(() => pingHistory
+    .filter((ping) => ping.coordVisibility === 'exact')
+    .map((ping, i) => {
     const pos = gridToLatLng(ping.x, ping.y);
     const color = getZoneColor(ping.zone);
     const isMe = userAddress ? ping.player === userAddress : true;
@@ -119,6 +123,13 @@ export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, 
       />
     );
   }), [pingHistory, userAddress]);
+
+  const unknownOpponentPingCount = useMemo(() => {
+    if (!userAddress) return 0;
+    return pingHistory.filter(
+      (ping) => ping.player !== userAddress && ping.coordVisibility === 'unknown'
+    ).length;
+  }, [pingHistory, userAddress]);
 
   const selectedMarker = useMemo(() => {
     if (!selectedCell) return null;
@@ -215,6 +226,21 @@ export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, 
           {selectedMarker}
           {debugMarkers}
         </MapContainer>
+
+        {unknownOpponentPingCount > 0 && (
+          <div className="absolute inset-0 pointer-events-none z-[650]">
+            <div
+              className="absolute inset-0"
+              style={{
+                backgroundImage: 'repeating-linear-gradient(135deg, rgba(251,191,36,0.10) 0 12px, rgba(251,191,36,0.03) 12px 24px)',
+              }}
+            />
+            <div className="absolute top-3 right-3 px-2.5 py-1.5 rounded border border-amber-400/35 bg-black/70 backdrop-blur-sm">
+              <p className="text-[9px] font-bold uppercase tracking-widest text-amber-300">OPP COORDS UNKNOWN</p>
+              <p className="text-[9px] text-amber-200/80">{unknownOpponentPingCount} unresolved ping{unknownOpponentPingCount === 1 ? '' : 's'}</p>
+            </div>
+          </div>
+        )}
 
         {/* Radar Scanner Overlay */}
         {!interactive && (

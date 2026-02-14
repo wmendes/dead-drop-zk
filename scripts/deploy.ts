@@ -159,13 +159,6 @@ let existingSecrets: Record<string, string | null> = {
   player2: null,
 };
 
-const existingEnv = await readEnvFile('.env');
-for (const identity of ['player1', 'player2']) {
-  const key = `VITE_DEV_${identity.toUpperCase()}_SECRET`;
-  const v = getEnvValue(existingEnv, key);
-  if (v && v !== 'NOT_AVAILABLE') existingSecrets[identity] = v;
-}
-
 // Load existing deployment info so partial deploys can preserve other IDs.
 const existingContractIds: Record<string, string> = {};
 let existingDeployment: any = null;
@@ -185,6 +178,67 @@ if (existsSync("deployment.json")) {
   }
 }
 
+const existingEnv = await readEnvFile('.env');
+const rawDeadDropVerifierMode = getEnvValue(existingEnv, 'DEAD_DROP_VERIFIER_MODE', 'mock').toLowerCase();
+const deadDropVerifierMode = rawDeadDropVerifierMode === 'real' ? 'real' : 'mock';
+const deadDropVerifierContractId = getEnvValue(
+  existingEnv,
+  'DEAD_DROP_VERIFIER_CONTRACT_ID',
+  getEnvValue(existingEnv, 'VITE_DEAD_DROP_VERIFIER_CONTRACT_ID')
+);
+const deadDropVerifierSelectorHex = getEnvValue(
+  existingEnv,
+  'DEAD_DROP_VERIFIER_SELECTOR_HEX',
+  getEnvValue(existingEnv, 'VITE_DEAD_DROP_VERIFIER_SELECTOR_HEX')
+);
+const deadDropProverUrl = getEnvValue(
+  existingEnv,
+  'VITE_DEAD_DROP_PROVER_URL',
+  existingDeployment?.deadDrop?.proverUrl || ""
+);
+const deadDropRelayerUrl = getEnvValue(
+  existingEnv,
+  'VITE_DEAD_DROP_RELAYER_URL',
+  existingDeployment?.deadDrop?.relayerUrl || ""
+);
+const ozRelayerApiKey = getEnvValue(existingEnv, 'OZ_RELAYER_API_KEY');
+const ozRelayerBaseUrl = getEnvValue(
+  existingEnv,
+  'OZ_RELAYER_BASE_URL',
+  'https://channels.openzeppelin.com/testnet'
+);
+const walletMode = getEnvValue(existingEnv, 'VITE_WALLET_MODE', existingDeployment?.wallet?.mode || 'dev');
+const smartAccountWasmHash = getEnvValue(
+  existingEnv,
+  'VITE_SMART_ACCOUNT_WASM_HASH',
+  existingDeployment?.wallet?.smartAccountWasmHash || ""
+);
+const smartAccountWebauthnVerifierAddress = getEnvValue(
+  existingEnv,
+  'VITE_SMART_ACCOUNT_WEBAUTHN_VERIFIER_ADDRESS',
+  existingDeployment?.wallet?.smartAccountWebauthnVerifierAddress || ""
+);
+const smartAccountRpName = getEnvValue(
+  existingEnv,
+  'VITE_SMART_ACCOUNT_RP_NAME',
+  existingDeployment?.wallet?.smartAccountRpName || "Dead Drop"
+);
+
+console.log(`Dead Drop verifier mode: ${deadDropVerifierMode}`);
+if (deadDropVerifierMode === "real") {
+  console.log(`Dead Drop external verifier: ${deadDropVerifierContractId || "(missing)"}`);
+}
+
+if (deadDropVerifierMode === "real" && !deadDropVerifierContractId) {
+  console.error("❌ DEAD_DROP_VERIFIER_CONTRACT_ID is required when DEAD_DROP_VERIFIER_MODE=real.");
+  process.exit(1);
+}
+for (const identity of ['player1', 'player2']) {
+  const key = `VITE_DEV_${identity.toUpperCase()}_SECRET`;
+  const v = getEnvValue(existingEnv, key);
+  if (v && v !== 'NOT_AVAILABLE') existingSecrets[identity] = v;
+}
+
 for (const contract of allContracts) {
   if (existingContractIds[contract.packageName]) continue;
   const envId = getEnvValue(existingEnv, `VITE_${contract.envKey}_CONTRACT_ID`);
@@ -202,7 +256,8 @@ try {
   await ensureTestnetFunded(walletAddresses.admin);
   console.log('✅ admin funded');
 } catch (error) {
-  console.error('❌ Failed to ensure admin is funded. Deployment cannot proceed.');
+  const details = error instanceof Error ? error.message : String(error);
+  console.error(`❌ Failed to ensure admin is funded. Deployment cannot proceed.\n   ${details}`);
   process.exit(1);
 }
 
@@ -228,7 +283,8 @@ for (const identity of ['player1', 'player2']) {
     await ensureTestnetFunded(keypair.publicKey());
     console.log(`✅ ${identity} funded\n`);
   } catch (error) {
-    console.warn(`⚠️  Warning: Failed to ensure ${identity} is funded, continuing anyway...`);
+    const details = error instanceof Error ? error.message : String(error);
+    console.warn(`⚠️  Warning: Failed to ensure ${identity} is funded, continuing anyway...\n   ${details}`);
   }
 }
 
@@ -291,7 +347,7 @@ if (shouldEnsureMock) {
 // Deploy mock-verifier first if requested (no constructor args)
 const mockVerifierContract = contracts.find((c) => c.packageName === "mock-verifier");
 let mockVerifierId = deployed["mock-verifier"] || "";
-if (mockVerifierContract) {
+if (mockVerifierContract && deadDropVerifierMode !== "real") {
   console.log(`Deploying ${mockVerifierContract.packageName}...`);
   try {
     console.log("  Installing WASM...");
@@ -331,15 +387,15 @@ for (const contract of contracts) {
 
     if (contract.packageName === "dead-drop") {
       // dead-drop needs verifier_id and ping_image_id in addition to admin + game_hub
-      const verifierId = mockVerifierId || existingContractIds["mock-verifier"] || "";
+      const verifierId = deadDropVerifierMode === "real"
+        ? deadDropVerifierContractId
+        : (mockVerifierId || existingContractIds["mock-verifier"] || "");
       if (!verifierId) {
-        console.error("❌ mock-verifier contract ID required for dead-drop. Deploy mock-verifier first.");
+        console.error("❌ dead-drop verifier contract ID is required. Set DEAD_DROP_VERIFIER_CONTRACT_ID for real mode or deploy mock-verifier for mock mode.");
         process.exit(1);
       }
-      // Use a zeroed-out image ID for mock mode; update via set_image_id later for real ZK
-      const pingImageId = "0707070707070707070707070707070707070707070707070707070707070707";
       deployResult =
-        (await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId} --verifier-id ${verifierId} --ping-image-id ${pingImageId}`.text());
+        (await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId} --verifier-id ${verifierId}`.text());
     } else {
       deployResult =
         (await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId}`.text());
@@ -386,6 +442,21 @@ const deploymentInfo = {
     player1: walletAddresses.player1,
     player2: walletAddresses.player2,
   },
+  deadDrop: {
+    verifierMode: deadDropVerifierMode,
+    verifierContractId: deadDropVerifierMode === "real"
+      ? deadDropVerifierContractId
+      : (mockVerifierId || existingContractIds["mock-verifier"] || ""),
+    verifierSelectorHex: deadDropVerifierSelectorHex,
+    proverUrl: deadDropProverUrl,
+    relayerUrl: deadDropRelayerUrl,
+  },
+  wallet: {
+    mode: walletMode,
+    smartAccountWasmHash,
+    smartAccountWebauthnVerifierAddress,
+    smartAccountRpName,
+  },
   deployedAt: new Date().toISOString(),
 };
 
@@ -403,6 +474,14 @@ const envContent = `# Auto-generated by deploy script
 VITE_SOROBAN_RPC_URL=${RPC_URL}
 VITE_NETWORK_PASSPHRASE=${NETWORK_PASSPHRASE}
 ${contractEnvLines}
+VITE_DEAD_DROP_PROVER_URL=${deadDropProverUrl}
+VITE_DEAD_DROP_RELAYER_URL=${deadDropRelayerUrl}
+VITE_DEAD_DROP_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.verifierContractId}
+VITE_DEAD_DROP_VERIFIER_SELECTOR_HEX=${deadDropVerifierSelectorHex}
+VITE_WALLET_MODE=${walletMode}
+VITE_SMART_ACCOUNT_WASM_HASH=${smartAccountWasmHash}
+VITE_SMART_ACCOUNT_WEBAUTHN_VERIFIER_ADDRESS=${smartAccountWebauthnVerifierAddress}
+VITE_SMART_ACCOUNT_RP_NAME=${smartAccountRpName}
 
 # Dev wallet addresses for testing
 VITE_DEV_ADMIN_ADDRESS=${walletAddresses.admin}
@@ -412,6 +491,13 @@ VITE_DEV_PLAYER2_ADDRESS=${walletAddresses.player2}
 # Dev wallet secret keys (WARNING: Never commit this file!)
 VITE_DEV_PLAYER1_SECRET=${walletSecrets.player1}
 VITE_DEV_PLAYER2_SECRET=${walletSecrets.player2}
+
+# Dead Drop verifier/prover mode
+DEAD_DROP_VERIFIER_MODE=${deadDropVerifierMode}
+DEAD_DROP_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.verifierContractId}
+DEAD_DROP_VERIFIER_SELECTOR_HEX=${deadDropVerifierSelectorHex}
+OZ_RELAYER_API_KEY=${ozRelayerApiKey}
+OZ_RELAYER_BASE_URL=${ozRelayerBaseUrl}
 `;
 
 await Bun.write('.env', envContent + '\n');

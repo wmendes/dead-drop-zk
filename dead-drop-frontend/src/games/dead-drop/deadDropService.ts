@@ -1,5 +1,13 @@
 import { Client as DeadDropClient, type Game, type Lobby } from './bindings';
-import { NETWORK_PASSPHRASE, RPC_URL, DEFAULT_METHOD_OPTIONS, DEFAULT_AUTH_TTL_MINUTES, MULTI_SIG_AUTH_TTL_MINUTES } from '@/utils/constants';
+import {
+  NETWORK_PASSPHRASE,
+  RPC_URL,
+  DEFAULT_METHOD_OPTIONS,
+  DEFAULT_AUTH_TTL_MINUTES,
+  MULTI_SIG_AUTH_TTL_MINUTES,
+  RUNTIME_SIMULATION_SOURCE,
+  DEV_PLAYER1_ADDRESS,
+} from '@/utils/constants';
 import { contract, TransactionBuilder, StrKey, xdr, Address, authorizeEntry, rpc } from '@stellar/stellar-sdk';
 import { Buffer } from 'buffer';
 import { signAndSendViaLaunchtube } from '@/utils/transactionHelper';
@@ -21,6 +29,9 @@ type ClientOptions = contract.ClientOptions;
 export class DeadDropService {
   private baseClient: DeadDropClient;
   private contractId: string;
+  private pingEventsCursorBySession = new Map<number, number>();
+  private readonly initialPingEventsBackfill = 240;
+  private readonly pingEventsRewind = 2;
 
   constructor(contractId: string) {
     this.contractId = contractId;
@@ -31,6 +42,15 @@ export class DeadDropService {
     });
   }
 
+  private resolveInvokerPublicKey(addressLike: string): string {
+    if (StrKey.isValidEd25519PublicKey(addressLike)) return addressLike;
+    if (StrKey.isValidEd25519PublicKey(RUNTIME_SIMULATION_SOURCE)) return RUNTIME_SIMULATION_SOURCE;
+    if (StrKey.isValidEd25519PublicKey(DEV_PLAYER1_ADDRESS)) return DEV_PLAYER1_ADDRESS;
+    throw new Error(
+      'No valid fee-payer account configured. Set VITE_SIMULATION_SOURCE_ADDRESS or VITE_DEV_PLAYER1_ADDRESS.'
+    );
+  }
+
   private createSigningClient(
     publicKey: string,
     signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>
@@ -39,9 +59,29 @@ export class DeadDropService {
       contractId: this.contractId,
       networkPassphrase: NETWORK_PASSPHRASE,
       rpcUrl: RPC_URL,
-      publicKey,
+      publicKey: this.resolveInvokerPublicKey(publicKey),
       ...signer,
     });
+  }
+
+  private ensureMutationSubmitted(
+    action: string,
+    sentTx: contract.SentTransaction<any>
+  ): void {
+    const txResponse = (sentTx as any)?.getTransactionResponse;
+    const status = txResponse?.status as string | undefined;
+    const hash = txResponse?.hash as string | undefined;
+
+    if (status && status !== 'SUCCESS') {
+      throw new Error(`${action} failed with status: ${status}`);
+    }
+
+    // If there's no response metadata at all, this likely fell back to a simulation-only path.
+    if (!status && !hash) {
+      throw new Error(
+        `${action} did not submit to the network (no transaction hash/status returned).`
+      );
+    }
   }
 
   // ========================================================================
@@ -91,7 +131,7 @@ export class DeadDropService {
       contractId: this.contractId,
       networkPassphrase: NETWORK_PASSPHRASE,
       rpcUrl: RPC_URL,
-      publicKey: player2,
+      publicKey: this.resolveInvokerPublicKey(player2),
     });
 
     const tx = await buildClient.start_game({
@@ -193,7 +233,7 @@ export class DeadDropService {
       contractId: this.contractId,
       networkPassphrase: NETWORK_PASSPHRASE,
       rpcUrl: RPC_URL,
-      publicKey: player2Address,
+      publicKey: this.resolveInvokerPublicKey(player2Address),
     });
 
     const tx = await buildClient.start_game({
@@ -238,7 +278,12 @@ export class DeadDropService {
     const validUntilLedgerSeq = await calculateValidUntilLedger(
       RPC_URL, authTtlMinutes ?? DEFAULT_AUTH_TTL_MINUTES
     );
-    const sentTx = await signAndSendViaLaunchtube(tx, DEFAULT_METHOD_OPTIONS.timeoutInSeconds, validUntilLedgerSeq);
+    const sentTx = await signAndSendViaLaunchtube(
+      tx,
+      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+      signer,
+      validUntilLedgerSeq
+    );
     return sentTx.result;
   }
 
@@ -260,7 +305,7 @@ export class DeadDropService {
       contractId: this.contractId,
       networkPassphrase: NETWORK_PASSPHRASE,
       rpcUrl: RPC_URL,
-      publicKey: player2Address,
+      publicKey: this.resolveInvokerPublicKey(player2Address),
       ...player2Signer,
     });
 
@@ -331,7 +376,12 @@ export class DeadDropService {
     tx.simulationData.result.auth = authEntries;
 
     // Now sign and send with player 2 (the invoker - their auth comes from transaction signature)
-    const sentTx = await signAndSendViaLaunchtube(tx, DEFAULT_METHOD_OPTIONS.timeoutInSeconds, validUntilLedgerSeq);
+    const sentTx = await signAndSendViaLaunchtube(
+      tx,
+      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+      player2Signer,
+      validUntilLedgerSeq
+    );
 
     if (!sentTx.result) {
       throw new Error('Transaction failed');
@@ -356,8 +406,14 @@ export class DeadDropService {
     }, DEFAULT_METHOD_OPTIONS);
 
     const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
-    const sentTx = await signAndSendViaLaunchtube(tx, DEFAULT_METHOD_OPTIONS.timeoutInSeconds, validUntilLedgerSeq);
-    return sentTx.result;
+    const sentTx = await signAndSendViaLaunchtube(
+      tx,
+      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+      signer,
+      validUntilLedgerSeq
+    );
+    this.ensureMutationSubmitted('open_game', sentTx);
+    return sentTx;
   }
 
   async joinGame(
@@ -374,7 +430,12 @@ export class DeadDropService {
     }, DEFAULT_METHOD_OPTIONS);
 
     const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
-    const sentTx = await signAndSendViaLaunchtube(tx, DEFAULT_METHOD_OPTIONS.timeoutInSeconds, validUntilLedgerSeq);
+    const sentTx = await signAndSendViaLaunchtube(
+      tx,
+      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+      signer,
+      validUntilLedgerSeq
+    );
     return sentTx.result;
   }
 
@@ -396,7 +457,12 @@ export class DeadDropService {
     }, DEFAULT_METHOD_OPTIONS);
 
     const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
-    const sentTx = await signAndSendViaLaunchtube(tx, DEFAULT_METHOD_OPTIONS.timeoutInSeconds, validUntilLedgerSeq);
+    const sentTx = await signAndSendViaLaunchtube(
+      tx,
+      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+      signer,
+      validUntilLedgerSeq
+    );
     return sentTx.result;
   }
 
@@ -405,11 +471,10 @@ export class DeadDropService {
     playerAddress: string,
     turn: number,
     distance: number,
-    x: number,
-    y: number,
-    journalHash: Buffer,
-    imageId: Buffer,
-    seal: Buffer,
+    partialDx: number,
+    partialDy: number,
+    proof: Buffer,
+    publicInputs: Buffer[],
     signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>
   ) {
     const client = this.createSigningClient(playerAddress, signer);
@@ -418,21 +483,31 @@ export class DeadDropService {
       player: playerAddress,
       turn,
       distance,
-      x,
-      y,
-      journal_hash: journalHash,
-      image_id: imageId,
-      seal,
+      partial_dx: partialDx,
+      partial_dy: partialDy,
+      proof,
+      public_inputs: publicInputs,
     }, DEFAULT_METHOD_OPTIONS);
 
     const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
     try {
-      const sentTx = await signAndSendViaLaunchtube(tx, DEFAULT_METHOD_OPTIONS.timeoutInSeconds, validUntilLedgerSeq);
+      const sentTx = await signAndSendViaLaunchtube(
+        tx,
+        DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+        signer,
+        validUntilLedgerSeq,
+      );
       if (sentTx.getTransactionResponse?.status === 'FAILED') {
         throw new Error('Transaction failed');
       }
       return sentTx.result;
     } catch (err) {
+      if (err instanceof Error && err.message.includes('Error(Contract, #8)')) {
+        throw new Error(
+          'Ping proof does not match current on-chain inputs (InvalidPublicInputs). ' +
+          'Refresh both players to sync state, then retry Send Ping.'
+        );
+      }
       if (err instanceof Error && err.message.includes('Transaction failed!')) {
         throw new Error('Transaction failed - check turn order and proof validity');
       }
@@ -446,7 +521,10 @@ export class DeadDropService {
     try {
       const server = new rpc.Server(RPC_URL);
       const latest = await server.getLatestLedger();
-      const startLedger = Math.max(1, latest.sequence - 10000);
+      const cursor = this.pingEventsCursorBySession.get(sessionId);
+      const startLedger = cursor !== undefined
+        ? Math.max(1, cursor - this.pingEventsRewind)
+        : Math.max(1, latest.sequence - this.initialPingEventsBackfill);
 
       // Fetch ALL contract events without topic filter — server-side topic
       // filtering is unreliable on the public testnet RPC. Filter client-side.
@@ -456,7 +534,18 @@ export class DeadDropService {
         limit: 200,
       });
 
-      console.log('getPingEvents raw:', events.events.length);
+      let maxLedgerSeen = startLedger;
+      for (const event of events.events) {
+        const ledger = Number((event as any).ledger);
+        if (Number.isFinite(ledger) && ledger > maxLedgerSeen) {
+          maxLedgerSeen = ledger;
+        }
+      }
+      const nextCursor = Math.max(
+        maxLedgerSeen + 1,
+        latest.sequence - this.pingEventsRewind
+      );
+      this.pingEventsCursorBySession.set(sessionId, nextCursor);
 
       // Pre-compute expected topic XDRs for client-side matching
       const expectedSymbol = xdr.ScVal.scvSymbol("ping").toXDR('base64');
@@ -469,7 +558,7 @@ export class DeadDropService {
             if (!t || t.length < 2) return false;
             // topic[0] must be Symbol("ping"), topic[1] must be our session_id
             return t[0].toXDR('base64') === expectedSymbol
-                && t[1].toXDR('base64') === expectedSessionId;
+              && t[1].toXDR('base64') === expectedSessionId;
           } catch { return false; }
         })
         .map(event => {
@@ -480,11 +569,11 @@ export class DeadDropService {
             const vec = val.vec();
             if (!vec || vec.length < 5) return null;
 
-            const player   = Address.fromScVal(vec[0]).toString();
-            const turn     = vec[1].u32();
+            const player = Address.fromScVal(vec[0]).toString();
+            const turn = vec[1].u32();
             const distance = vec[2].u32();
-            const x        = vec[3].u32();
-            const y        = vec[4].u32();
+            const x = vec[3].u32();
+            const y = vec[4].u32();
 
             return { player, turn, distance, x, y };
           } catch (e) {
@@ -511,7 +600,12 @@ export class DeadDropService {
     }, DEFAULT_METHOD_OPTIONS);
 
     const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
-    const sentTx = await signAndSendViaLaunchtube(tx, DEFAULT_METHOD_OPTIONS.timeoutInSeconds, validUntilLedgerSeq);
+    const sentTx = await signAndSendViaLaunchtube(
+      tx,
+      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+      signer,
+      validUntilLedgerSeq
+    );
     return sentTx.result;
   }
 }

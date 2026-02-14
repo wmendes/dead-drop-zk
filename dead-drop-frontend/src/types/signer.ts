@@ -3,6 +3,7 @@
  * Compatible with both Freighter wallet and dev wallets
  */
 import type { WalletError } from '@stellar/stellar-sdk/contract';
+import type { AssembledTransaction } from '@stellar/stellar-sdk/contract';
 
 export interface ContractSigner {
   /**
@@ -36,4 +37,10 @@ export interface ContractSigner {
     signerAddress?: string;
     error?: WalletError;
   }>;
+
+  /**
+   * Optional hook for signers that can sign assembled transactions directly
+   * (e.g. smart-account passkey flows) before custom submission.
+   */
+  signAssembledTransaction?: (tx: AssembledTransaction<unknown>) => Promise<void>;
 }

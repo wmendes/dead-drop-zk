@@ -15,6 +15,10 @@ export const NETWORK_PASSPHRASE =
   import.meta.env.VITE_NETWORK_PASSPHRASE ||
   'Test SDF Network ; September 2015';
 export const NETWORK = SOROBAN_RPC_URL.includes('testnet') ? 'testnet' : 'mainnet';
+export const WALLET_MODE =
+  runtimeConfig?.walletMode ||
+  import.meta.env.VITE_WALLET_MODE ||
+  'dev';
 
 function contractEnvKey(crateName: string): string {
   // Crate name -> env key matches scripts/utils/contracts.ts: hyphens become underscores.
@@ -64,10 +68,40 @@ export const DICE_DUEL_CONTRACT = getContractId('dice-duel');
 export const DEV_ADMIN_ADDRESS = import.meta.env.VITE_DEV_ADMIN_ADDRESS || '';
 export const DEV_PLAYER1_ADDRESS = import.meta.env.VITE_DEV_PLAYER1_ADDRESS || '';
 export const DEV_PLAYER2_ADDRESS = import.meta.env.VITE_DEV_PLAYER2_ADDRESS || '';
+export const DEV_PLAYER1_SECRET = import.meta.env.VITE_DEV_PLAYER1_SECRET || '';
+export const DEV_PLAYER2_SECRET = import.meta.env.VITE_DEV_PLAYER2_SECRET || '';
 
 // Runtime-configurable simulation source (for standalone builds)
 export const RUNTIME_SIMULATION_SOURCE =
   runtimeConfig?.simulationSourceAddress || import.meta.env.VITE_SIMULATION_SOURCE_ADDRESS || '';
+export const DEAD_DROP_PROVER_URL =
+  runtimeConfig?.deadDropProverUrl || import.meta.env.VITE_DEAD_DROP_PROVER_URL || '';
+export const DEAD_DROP_RELAYER_URL =
+  runtimeConfig?.deadDropRelayerUrl || import.meta.env.VITE_DEAD_DROP_RELAYER_URL || '';
+export const DEAD_DROP_VERIFIER_CONTRACT_ID =
+  runtimeConfig?.deadDropVerifierContractId ||
+  import.meta.env.VITE_DEAD_DROP_VERIFIER_CONTRACT_ID ||
+  '';
+export const DEAD_DROP_PING_IMAGE_ID =
+  runtimeConfig?.deadDropPingImageId ||
+  import.meta.env.VITE_DEAD_DROP_PING_IMAGE_ID ||
+  '';
+export const DEAD_DROP_VERIFIER_SELECTOR_HEX =
+  runtimeConfig?.deadDropVerifierSelectorHex ||
+  import.meta.env.VITE_DEAD_DROP_VERIFIER_SELECTOR_HEX ||
+  '';
+export const SMART_ACCOUNT_WASM_HASH =
+  runtimeConfig?.smartAccountWasmHash ||
+  import.meta.env.VITE_SMART_ACCOUNT_WASM_HASH ||
+  '';
+export const SMART_ACCOUNT_WEBAUTHN_VERIFIER_ADDRESS =
+  runtimeConfig?.smartAccountWebauthnVerifierAddress ||
+  import.meta.env.VITE_SMART_ACCOUNT_WEBAUTHN_VERIFIER_ADDRESS ||
+  '';
+export const SMART_ACCOUNT_RP_NAME =
+  runtimeConfig?.smartAccountRpName ||
+  import.meta.env.VITE_SMART_ACCOUNT_RP_NAME ||
+  'Dead Drop';
 
 // Transaction options
 export const DEFAULT_METHOD_OPTIONS = {

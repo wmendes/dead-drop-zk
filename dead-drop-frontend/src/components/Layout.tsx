@@ -9,7 +9,8 @@ interface LayoutProps {
 }
 
 export function Layout({ title, subtitle, children }: LayoutProps) {
-  const { connectDev, switchPlayer, getCurrentDevPlayer, isConnected, walletType } = useWallet();
+  const { connectDev, switchPlayer, getCurrentDevPlayer, isConnected, walletType, walletMode } = useWallet();
+  const isDevMode = walletMode === 'dev' || walletMode === 'hybrid';
   const currentPlayer = getCurrentDevPlayer();
 
   const resolvedTitle = title || import.meta.env.VITE_GAME_TITLE || 'Stellar Game';
@@ -17,6 +18,10 @@ export function Layout({ title, subtitle, children }: LayoutProps) {
 
   const onPlayerSelect = async (player: 1 | 2) => {
     try {
+      if (!isDevMode) {
+        return;
+      }
+
       if (!isConnected) {
         await connectDev(player);
       } else if (walletType === 'dev') {
@@ -31,10 +36,10 @@ export function Layout({ title, subtitle, children }: LayoutProps) {
 
   // Auto-connect to Player 1 if not connected
   useEffect(() => {
-    if (!isConnected && !walletType) {
+    if (isDevMode && !isConnected && !walletType) {
       connectDev(1).catch(console.error);
     }
-  }, [isConnected, connectDev, walletType]);
+  }, [isConnected, connectDev, walletType, isDevMode]);
 
   return (
     <div className="studio">
@@ -58,20 +63,22 @@ export function Layout({ title, subtitle, children }: LayoutProps) {
         <span>Built with the Stellar Game Studio</span>
       </footer>
 
-      <div className="studio-footer-menu">
-        <button
-          className={`player-switch-button p1 ${currentPlayer === 1 ? 'active' : ''}`}
-          onClick={() => onPlayerSelect(1)}
-        >
-          Player 1
-        </button>
-        <button
-          className={`player-switch-button p2 ${currentPlayer === 2 ? 'active' : ''}`}
-          onClick={() => onPlayerSelect(2)}
-        >
-          Player 2
-        </button>
-      </div>
+      {isDevMode && (
+        <div className="studio-footer-menu">
+          <button
+            className={`player-switch-button p1 ${currentPlayer === 1 ? 'active' : ''}`}
+            onClick={() => onPlayerSelect(1)}
+          >
+            Player 1
+          </button>
+          <button
+            className={`player-switch-button p2 ${currentPlayer === 2 ? 'active' : ''}`}
+            onClick={() => onPlayerSelect(2)}
+          >
+            Player 2
+          </button>
+        </div>
+      )}
     </div>
   );
 }

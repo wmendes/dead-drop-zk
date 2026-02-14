@@ -4,7 +4,7 @@ export interface WalletState {
   // Wallet connection
   publicKey: string | null;
   walletId: string | null; // ID of the connected wallet
-  walletType: 'dev' | 'wallet' | null; // Track if dev wallet or real wallet
+  walletType: 'dev' | 'wallet' | 'smart-account' | null;
   isConnected: boolean;
   isConnecting: boolean;
 
@@ -16,7 +16,7 @@ export interface WalletState {
   error: string | null;
 
   // Actions
-  setWallet: (publicKey: string, walletId: string, walletType: 'dev' | 'wallet') => void;
+  setWallet: (publicKey: string, walletId: string, walletType: 'dev' | 'wallet' | 'smart-account') => void;
   setPublicKey: (publicKey: string) => void;
   setConnected: (connected: boolean) => void;
   setConnecting: (connecting: boolean) => void;
@@ -65,10 +65,12 @@ export const useWalletStore = create<WalletState>()((set) => ({
     }),
 
   setConnecting: (connecting) =>
-    set({
+    set((state) => ({
       isConnecting: connecting,
-      error: null,
-    }),
+      // Clear stale errors when a new connection attempt starts,
+      // but preserve a freshly-set error after a failed attempt.
+      error: connecting ? null : state.error,
+    })),
 
   setNetwork: (network, networkPassphrase) =>
     set({

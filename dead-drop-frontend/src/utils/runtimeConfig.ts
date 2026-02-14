@@ -3,6 +3,15 @@ export interface RuntimeConfig {
   networkPassphrase?: string;
   contractIds?: Record<string, string>;
   simulationSourceAddress?: string;
+  walletMode?: 'dev' | 'wallet' | 'smart-account' | 'hybrid';
+  smartAccountWasmHash?: string;
+  smartAccountWebauthnVerifierAddress?: string;
+  smartAccountRpName?: string;
+  deadDropProverUrl?: string;
+  deadDropRelayerUrl?: string;
+  deadDropVerifierContractId?: string;
+  deadDropPingImageId?: string;
+  deadDropVerifierSelectorHex?: string;
 }
 
 export function getRuntimeConfig(): RuntimeConfig | null {

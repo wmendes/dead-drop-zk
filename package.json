@@ -5,17 +5,21 @@
   "scripts": {
     "setup": "bun run scripts/setup.ts",
     "build": "bun run scripts/build.ts",
+    "build:proof": "cargo build --release -p dead-drop-proof-host --manifest-path=risc0/dead_drop_proof/Cargo.toml",
     "deploy": "bun run scripts/deploy.ts",
     "bindings": "bun run scripts/bindings.ts",
     "create": "bun run scripts/create.ts",
     "publish": "bun run scripts/publish.ts",
-    "dev": "bun --cwd=dead-drop- run dev",
+    "dev:prover": "node backend/dead-drop-prover/index.js",
+    "dev": "bun --cwd=dead-drop-frontend run dev",
     "dev:game": "bun run scripts/dev-game.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
   },
   "dependencies": {
-    "@stellar/stellar-sdk": "^14.5.0"
+    "@openzeppelin/relayer-plugin-channels": "latest",
+    "@stellar/stellar-sdk": "^14.5.0",
+    "ws": "^8.18.3"
   }
 }

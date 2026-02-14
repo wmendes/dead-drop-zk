@@ -10,6 +10,11 @@
 //! **Game Hub Integration:**
 //! This game is Game Hub-aware. All sessions go through `start_game`
 //! and `end_game` on the Game Hub contract.
+//!
+//! **ZK Proof System:**
+//! Uses Noir + UltraHonk for client-side proof generation.
+//! Commitment = Poseidon2(x, y, salt) stored as BytesN<32>.
+//! Verification via cross-contract call to UltraHonk verifier.
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype,
@@ -51,8 +56,8 @@ pub enum Error {
     AlreadyCommitted = 5,
     NotYourTurn = 6,
     InvalidTurn = 7,
-    InvalidImageId = 8,
-    InvalidJournalHash = 9,
+    InvalidPublicInputs = 8,
+    // 9 reserved (was InvalidJournalHash)
     ProofVerificationFailed = 10,
     TimeoutNotReached = 11,
     InvalidDistance = 12,
@@ -111,7 +116,6 @@ pub enum DataKey {
     GameHubAddress,
     Admin,
     VerifierId,
-    PingImageId,
 }
 
 // ============================================================================
@@ -124,6 +128,12 @@ const GAME_TTL_LEDGERS: u32 = 518_400;
 /// Maximum number of turns (each player gets 15 pings)
 const MAX_TURNS: u32 = 30;
 
+/// Grid dimensions for coordinate bounds checks.
+const GRID_SIZE: u32 = 100;
+
+/// Max wrapped Manhattan distance on a 100x100 toroidal grid.
+const MAX_DISTANCE: u32 = 100;
+
 /// Timeout threshold in ledgers (~50 minutes = 600 ledgers)
 const TIMEOUT_LEDGERS: u32 = 600;
 
@@ -132,6 +142,10 @@ const NO_DISTANCE: u32 = u32::MAX;
 
 /// Sentinel value for "no commitment yet"
 const EMPTY_COMMITMENT: [u8; 32] = [0u8; 32];
+
+/// Number of public inputs expected from the Noir circuit.
+/// [session_id, turn, partial_dx, partial_dy, responder_commitment, expected_distance]
+const NUM_PUBLIC_INPUTS: usize = 6;
 
 // ============================================================================
 // Contract
@@ -148,7 +162,6 @@ impl DeadDropContract {
         admin: Address,
         game_hub: Address,
         verifier_id: Address,
-        ping_image_id: BytesN<32>,
     ) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -157,9 +170,6 @@ impl DeadDropContract {
         env.storage()
             .instance()
             .set(&DataKey::VerifierId, &verifier_id);
-        env.storage()
-            .instance()
-            .set(&DataKey::PingImageId, &ping_image_id);
     }
 
     /// Start a new game session between two players.
@@ -171,9 +181,24 @@ impl DeadDropContract {
         player1_points: i128,
         player2_points: i128,
     ) -> Result<(), Error> {
+        // Points must be positive.
+        if player1_points <= 0 || player2_points <= 0 {
+            return Err(Error::InvalidDistance);
+        }
+
         // Prevent self-play
         if player1 == player2 {
             return Err(Error::SelfPlay);
+        }
+
+        // Reject if session slot is already in use.
+        let game_key = DataKey::Game(session_id);
+        if env.storage().temporary().has(&game_key) {
+            return Err(Error::LobbyAlreadyExists);
+        }
+        let lobby_key = DataKey::Lobby(session_id);
+        if env.storage().temporary().has(&lobby_key) {
+            return Err(Error::LobbyAlreadyExists);
         }
 
         // Require auth from both players for their points
@@ -216,17 +241,16 @@ impl DeadDropContract {
             last_action_ledger: env.ledger().sequence(),
         };
 
-        let key = DataKey::Game(session_id);
-        env.storage().temporary().set(&key, &game);
+        env.storage().temporary().set(&game_key, &game);
         env.storage()
             .temporary()
-            .extend_ttl(&key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
+            .extend_ttl(&game_key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
 
         Ok(())
     }
 
-    /// Submit a SHA-256 commitment of the player's secret coordinates.
-    /// commitment = SHA256(x_le || y_le || salt)   (4 + 4 + 32 = 40 bytes)
+    /// Submit a Poseidon2 commitment of the player's secret coordinates.
+    /// commitment = Poseidon2(x, y, salt) — 32 bytes big-endian
     pub fn commit_secret(
         env: Env,
         session_id: u32,
@@ -281,24 +305,28 @@ impl DeadDropContract {
         Ok(())
     }
 
-    /// Submit a ping result with ZK proof verification.
+    /// Submit a ping result with ZK proof verification (Noir + UltraHonk).
     ///
-    /// The pinging player sends a coordinate to the responder off-chain.
-    /// The responder computes the Manhattan distance and generates a ZK proof.
-    /// This method verifies the proof and records the distance.
+    /// The pinger sends partial offsets to the responder:
+    /// partial_dx = (ping_x - pinger_secret_x) mod 100
+    /// partial_dy = (ping_y - pinger_secret_y) mod 100
     ///
-    /// Journal layout: [session_id(4) || turn(4) || distance(4) || commitment(32)] = 44 bytes LE
+    /// The responder proves:
+    /// - their secret matches their commitment
+    /// - distance(partial, responder_secret) == expected_distance
+    ///
+    /// Public inputs layout (6 x 32-byte big-endian field elements):
+    /// [session_id, turn, partial_dx, partial_dy, responder_commitment, expected_distance]
     pub fn submit_ping(
         env: Env,
         session_id: u32,
         player: Address,
         turn: u32,
         distance: u32,
-        x: u32,
-        y: u32,
-        journal_hash: BytesN<32>,
-        image_id: BytesN<32>,
-        seal: Bytes,
+        partial_dx: u32,
+        partial_dy: u32,
+        proof: Bytes,
+        public_inputs: Vec<BytesN<32>>,
     ) -> Result<Option<Address>, Error> {
         player.require_auth();
 
@@ -315,6 +343,12 @@ impl DeadDropContract {
         if game.status != GameStatus::Active {
             return Err(Error::InvalidGameStatus);
         }
+        if partial_dx >= GRID_SIZE || partial_dy >= GRID_SIZE {
+            return Err(Error::InvalidDistance);
+        }
+        if distance > MAX_DISTANCE {
+            return Err(Error::InvalidDistance);
+        }
         if turn != game.current_turn {
             return Err(Error::InvalidTurn);
         }
@@ -322,64 +356,71 @@ impl DeadDropContract {
             return Err(Error::MaxTurnsReached);
         }
 
-        // Determine who is pinging and who is responding
+        // Determine who is pinging and validate it's their turn
         let is_player1_turn = game.whose_turn == 1;
-        let (pinger, responder_commitment) = if is_player1_turn {
-            // Player1 is pinging → responder is player2 → proof verifies against commitment2
+        let pinger = if is_player1_turn {
+            // Player1 is pinging
             if player != game.player1 {
                 return Err(Error::NotYourTurn);
             }
-            (&game.player1, &game.commitment2)
+            &game.player1
         } else {
-            // Player2 is pinging → responder is player1 → proof verifies against commitment1
+            // Player2 is pinging
             if player != game.player2 {
                 return Err(Error::NotYourTurn);
             }
-            (&game.player2, &game.commitment1)
+            &game.player2
         };
 
-        // Verify image_id matches stored value
-        let stored_image_id: BytesN<32> = env
-            .storage()
-            .instance()
-            .get(&DataKey::PingImageId)
-            .expect("PingImageId not set");
-        if stored_image_id != image_id {
-            return Err(Error::InvalidImageId);
+        // Validate public inputs count
+        if public_inputs.len() != NUM_PUBLIC_INPUTS as u32 {
+            return Err(Error::InvalidPublicInputs);
         }
 
-        // Reconstruct expected journal and verify hash
-        // Journal: [session_id(4) || turn(4) || distance(4) || commitment(32)] = 44 bytes LE
-        let mut journal_data = [0u8; 44];
-        journal_data[0..4].copy_from_slice(&session_id.to_le_bytes());
-        journal_data[4..8].copy_from_slice(&turn.to_le_bytes());
-        journal_data[8..12].copy_from_slice(&distance.to_le_bytes());
+        // Reconstruct expected public inputs from on-chain state and submitted params.
+        // The responder commitment depends on turn:
+        // - if player1 is pinging, responder is player2
+        // - if player2 is pinging, responder is player1
+        let responder_commitment = if is_player1_turn {
+            &game.commitment2
+        } else {
+            &game.commitment1
+        };
 
-        let commitment_bytes = responder_commitment.to_array();
-        journal_data[12..44].copy_from_slice(&commitment_bytes);
+        let expected_inputs = build_public_inputs(
+            &env,
+            session_id,
+            turn,
+            partial_dx,
+            partial_dy,
+            responder_commitment,
+            distance,
+        );
 
-        let journal_bytes = Bytes::from_array(&env, &journal_data);
-        let expected_journal_hash: BytesN<32> = env.crypto().sha256(&journal_bytes).into();
-
-        if journal_hash != expected_journal_hash {
-            return Err(Error::InvalidJournalHash);
+        // Compare submitted public inputs against expected values
+        for i in 0..NUM_PUBLIC_INPUTS {
+            let submitted = public_inputs.get(i as u32).unwrap();
+            let expected = expected_inputs.get(i as u32).unwrap();
+            if submitted != expected {
+                return Err(Error::InvalidPublicInputs);
+            }
         }
 
-        // Verify ZK proof via cross-contract call
+        // Verify ZK proof via cross-contract call to UltraHonk verifier
         let verifier_addr: Address = env
             .storage()
             .instance()
             .get(&DataKey::VerifierId)
             .expect("VerifierId not set");
 
-        verify_proof(&env, &verifier_addr, &journal_hash, &image_id, &seal);
+        verify_proof(&env, &verifier_addr, &proof, &public_inputs)?;
 
         // Emit ping event for frontend syncing
         // Topic: ["ping", session_id]
-        // Data: [player, turn, distance, x, y]
+        // Data: [player, turn, distance, partial_dx, partial_dy]
         env.events().publish(
             (Symbol::new(&env, "ping"), session_id),
-            (player.clone(), turn, distance, x, y),
+            (player.clone(), turn, distance, partial_dx, partial_dy),
         );
 
         // Record distance and update best
@@ -526,6 +567,10 @@ impl DeadDropContract {
         host: Address,
         host_points: i128,
     ) -> Result<(), Error> {
+        if host_points <= 0 {
+            return Err(Error::InvalidDistance);
+        }
+
         host.require_auth_for_args(
             vec![&env, session_id.into_val(&env), host_points.into_val(&env)],
         );
@@ -561,6 +606,10 @@ impl DeadDropContract {
         joiner: Address,
         joiner_points: i128,
     ) -> Result<(), Error> {
+        if joiner_points <= 0 {
+            return Err(Error::InvalidDistance);
+        }
+
         joiner.require_auth_for_args(
             vec![&env, session_id.into_val(&env), joiner_points.into_val(&env)],
         );
@@ -681,18 +730,6 @@ impl DeadDropContract {
             .set(&DataKey::VerifierId, &new_verifier);
     }
 
-    pub fn set_image_id(env: Env, new_image_id: BytesN<32>) {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        admin.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::PingImageId, &new_image_id);
-    }
-
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin: Address = env
             .storage()
@@ -718,29 +755,61 @@ impl DeadDropContract {
 }
 
 // ============================================================================
-// ZK Proof Verification (cross-contract call)
+// Public Inputs Construction
+// ============================================================================
+
+/// Convert a u32 value to a 32-byte big-endian field element (BytesN<32>).
+/// The u32 is placed in the last 4 bytes of a 32-byte zero-padded array.
+fn u32_to_field_bytes(env: &Env, value: u32) -> BytesN<32> {
+    let mut buf = [0u8; 32];
+    buf[28..32].copy_from_slice(&value.to_be_bytes());
+    BytesN::from_array(env, &buf)
+}
+
+/// Build the expected public inputs vector from on-chain state.
+/// Order must match the Noir circuit's public input declarations:
+/// [session_id, turn, partial_dx, partial_dy, responder_commitment, expected_distance]
+fn build_public_inputs(
+    env: &Env,
+    session_id: u32,
+    turn: u32,
+    partial_dx: u32,
+    partial_dy: u32,
+    responder_commitment: &BytesN<32>,
+    distance: u32,
+) -> Vec<BytesN<32>> {
+    let mut inputs = Vec::new(env);
+    inputs.push_back(u32_to_field_bytes(env, session_id));
+    inputs.push_back(u32_to_field_bytes(env, turn));
+    inputs.push_back(u32_to_field_bytes(env, partial_dx));
+    inputs.push_back(u32_to_field_bytes(env, partial_dy));
+    inputs.push_back(responder_commitment.clone());
+    inputs.push_back(u32_to_field_bytes(env, distance));
+    inputs
+}
+
+// ============================================================================
+// ZK Proof Verification (cross-contract call to UltraHonk verifier)
 // ============================================================================
 
 fn verify_proof(
     env: &Env,
     verifier_id: &Address,
-    journal_hash: &BytesN<32>,
-    image_id: &BytesN<32>,
-    seal: &Bytes,
-) {
+    proof: &Bytes,
+    public_inputs: &Vec<BytesN<32>>,
+) -> Result<(), Error> {
     let mut args: Vec<Val> = Vec::new(env);
-    args.push_back(seal.into_val(env));
-    args.push_back(image_id.into_val(env));
-    args.push_back(journal_hash.into_val(env));
+    args.push_back(proof.into_val(env));
+    args.push_back(public_inputs.into_val(env));
 
     let result = env.try_invoke_contract::<Val, InvokeError>(
         verifier_id,
-        &Symbol::new(env, "verify"),
+        &Symbol::new(env, "verify_proof"),
         args,
     );
     match result {
-        Ok(Ok(_)) => {}
-        Ok(Err(_)) | Err(_) => panic!("ZK proof verification failed"),
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(Error::ProofVerificationFailed),
     }
 }
 

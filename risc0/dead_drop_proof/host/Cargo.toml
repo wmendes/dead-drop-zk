@@ -1,0 +1,11 @@
+[package]
+name = "dead-drop-proof-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+hex = "0.4.3"
+risc0-zkvm = { version = "3.0.4", features = ["prove"] }
+sha2 = "0.10.8"
+dead-drop-proof-methods = { path = "../methods" }

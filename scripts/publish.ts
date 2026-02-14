@@ -270,7 +270,16 @@ const runtimeConfig = {
   contractIds: {
     [gameSlug]: contractId,
   },
+  walletMode: env.VITE_WALLET_MODE || 'wallet',
+  smartAccountWasmHash: env.VITE_SMART_ACCOUNT_WASM_HASH || '',
+  smartAccountWebauthnVerifierAddress: env.VITE_SMART_ACCOUNT_WEBAUTHN_VERIFIER_ADDRESS || '',
+  smartAccountRpName: env.VITE_SMART_ACCOUNT_RP_NAME || '',
   simulationSourceAddress: env.VITE_SIMULATION_SOURCE_ADDRESS || '',
+  deadDropProverUrl: env.VITE_DEAD_DROP_PROVER_URL || '',
+  deadDropRelayerUrl: env.VITE_DEAD_DROP_RELAYER_URL || '',
+  deadDropVerifierContractId: env.VITE_DEAD_DROP_VERIFIER_CONTRACT_ID || '',
+  deadDropPingImageId: env.VITE_DEAD_DROP_PING_IMAGE_ID || '',
+  deadDropVerifierSelectorHex: env.VITE_DEAD_DROP_VERIFIER_SELECTOR_HEX || '',
 };
 
 const configText = `window.__STELLAR_GAME_STUDIO_CONFIG__ = ${JSON.stringify(runtimeConfig, null, 2)};\n`;

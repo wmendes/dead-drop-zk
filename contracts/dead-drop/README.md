@@ -1,129 +1,106 @@
-# Dead Drop Game
+# Dead Drop Contract
 
-A simple two-player guessing game smart contract built on Stellar's Soroban platform.
+Dead Drop is a 1v1 Soroban game contract where each player commits a hidden grid coordinate and players alternate submitting ZK-verified ping results until someone finds the drop or the game times out.
 
 ## Overview
 
-Players compete by guessing a number between 1 and 10. The player whose guess is closest to the randomly generated number wins.
+- Grid: `100 x 100` toroidal map.
+- Commitments: each player stores `Poseidon2(x, y, salt)` → 32 bytes (BN254 field element).
+- Ping proof: contract verifies an UltraHonk proof against the responder commitment.
+- Lifecycle: integrated with Game Hub `start_game` / `end_game`.
+- Storage: temporary storage with TTL extension on each game write.
 
-## Features
+## Constructor
 
-- **Random Number Generation**: Uses Soroban's PRNG to generate fair random numbers
-- **Two-Player Games**: Each game involves exactly two players
-- **Simple Rules**: Guess a number 1-10, closest guess wins
-- **Multiple Concurrent Games**: Support for multiple independent games running simultaneously
-- **Event Emissions**: All game actions emit events for tracking
+`__constructor(env, admin, game_hub, verifier_id)`
 
-## Contract Methods
+Initializes:
+- `Admin`
+- `GameHubAddress`
+- `VerifierId`
 
-### `start_game`
-Start a new game between two players.
+## Core Methods
 
-**Parameters:**
-- `player1: Address` - First player's address
-- `player2: Address` - Second player's address
+### Match setup
 
-**Returns:** `u32` - The game ID
+- `open_game(session_id, host, host_points)`
+  - Single-sig lobby creation (Player 1).
+  - Stores lobby state; returns room code (= `session_id`).
+  - Rejects non-positive `host_points`.
 
-**Auth:** Requires authentication from both players
+- `join_game(session_id, joiner, joiner_points)`
+  - Single-sig lobby join (Player 2).
+  - Rejects self-play and non-positive `joiner_points`.
+  - Calls Game Hub `start_game` and creates the active session.
 
-### `make_guess`
-Make a guess for a game.
+- `start_game(session_id, player1, player2, player1_points, player2_points)`
+  - Two-sig variant (legacy/dev). Requires auth from both players.
+  - Rejects self-play and duplicate sessions.
+  - Calls Game Hub `start_game` before writing game state.
 
-**Parameters:**
-- `game_id: u32` - The ID of the game
-- `player: Address` - Address of the player making the guess
-- `guess: u32` - The guessed number (must be 1-10)
+### Gameplay
 
-**Returns:** `Result<(), Error>`
+- `commit_secret(session_id, player, commitment)`
+  - Stores player commitment (32-byte Poseidon2 hash).
+  - Transitions `Created -> Committing -> Active`.
 
-**Auth:** Requires authentication from the guessing player
+- `submit_ping(session_id, player, turn, distance, partial_dx, partial_dy, proof, public_inputs)`
+  - Validates turn order, status, bounds, and max distance.
+  - Public inputs (6 × 32-byte big-endian field elements):
+    `[session_id, turn, partial_dx, partial_dy, responder_commitment, expected_distance]`
+  - Calls UltraHonk verifier contract with proof bytes + public inputs.
+  - Emits `"ping"` event with `(player, turn, distance, partial_dx, partial_dy)`.
+  - Ends game immediately on `distance == 0`.
+  - Ends at turn cap (`30`) via best-distance comparison (player1 wins ties).
+  - Calls Game Hub `end_game` before returning winner.
 
-### `reveal_winner`
-Reveal the winner after both players have guessed.
+- `force_timeout(session_id, player)`
+  - Allows either player to claim timeout after inactivity threshold (`600` ledgers).
+  - Marks timeout winner and reports Game Hub `end_game`.
 
-**Parameters:**
-- `game_id: u32` - The ID of the game
+### Read methods
 
-**Returns:** `Result<Address, Error>` - Address of the winning player
+- `get_game(session_id) -> Game`
+- `get_lobby(session_id) -> Lobby`
 
-**Note:** Can only be called after both players have made their guesses. If both players are equidistant from the winning number, player1 wins.
+### Admin methods
 
-### `get_game`
-Get the current state of a game.
+- `get_admin`, `set_admin`
+- `get_hub`, `set_hub`
+- `set_verifier`
+- `upgrade(new_wasm_hash)`
 
-**Parameters:**
-- `game_id: u32` - The ID of the game
+## ZK Proof System
 
-**Returns:** `Result<Game, Error>` - The game state
+Proofs are generated **entirely client-side** in the browser using:
+- **Noir** (`@noir-lang/noir_js ^1.0.0-beta.18`) — circuit witness generation
+- **Barretenberg UltraHonk** (`@aztec/bb.js ^2.1.11`) — WASM-based proof generation
 
-## Game Flow
+The Noir circuit verifies:
+1. `Poseidon2(responder_x, responder_y, salt) == expected_commitment`
+2. `wrappedManhattan(partial_dx, partial_dy, responder_x, responder_y) == expected_distance`
 
-1. Two players call `start_game` to create a new game
-2. A random number between 1-10 is generated using PRNG
-3. Each player calls `make_guess` with their guess (1-10)
-4. Once both players have guessed, anyone can call `reveal_winner`
-5. The winner is determined by who guessed closest to the random number
-6. The game is marked as ended and the winner is recorded
+No backend prover is required. The responder's browser generates the proof and sends it
+to the pinger via WebRTC / Session Push relay.
 
-## Events
+## Game Statuses
 
-- **GameStartedEvent**: Emitted when a new game begins
-  - `game_id: u32`
-  - `player1: Address`
-  - `player2: Address`
+- `Created`
+- `Committing`
+- `Active`
+- `Completed`
+- `Timeout`
 
-- **GuessMadeEvent**: Emitted when a player makes a guess
-  - `game_id: u32`
-  - `player: Address`
-  - `guess: u32`
+## Storage and TTL
 
-- **WinnerRevealedEvent**: Emitted when the winner is revealed
-  - `game_id: u32`
-  - `winner: Address`
-  - `winning_number: u32`
+- Session and lobby state use temporary storage.
+- TTL target: ~30 days (`518,400` ledgers), refreshed on every game write.
 
-## Error Codes
+## Build and Test
 
-- `GameNotFound` (1): The specified game ID doesn't exist
-- `GameAlreadyStarted` (2): Game has already been started
-- `NotPlayer` (3): Caller is not a player in this game
-- `AlreadyGuessed` (4): Player has already made their guess
-- `BothPlayersNotGuessed` (5): Cannot reveal winner until both players guess
-- `GameAlreadyEnded` (6): Game has already ended
-
-## Building
-
-```bash
-stellar contract build
-```
-
-Output: `target/wasm32v1-none/release/number_guess.wasm`
-
-## Testing
+From repo root:
 
 ```bash
-cargo test
+bun run build dead-drop
+cargo test -p dead-drop
 ```
-
-## Example Usage
-
-```rust
-use soroban_sdk::{Address, Env};
-
-// Create game
-let game_id = contract.start_game(&player1, &player2);
-
-// Players make guesses
-contract.make_guess(&game_id, &player1, &5);
-contract.make_guess(&game_id, &player2, &7);
-
-// Reveal winner
-let winner = contract.reveal_winner(&game_id);
-```
-
-## Technical Details
-
-- **PRNG Warning**: The contract uses Soroban's PRNG which is unsuitable for generating secrets or high-stakes applications. It's perfectly fine for game mechanics where the random number is revealed immediately after use.
-- **Storage**: Uses persistent storage for game state
-- **Gas Optimization**: Minimal storage footprint per game

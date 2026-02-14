@@ -31,12 +31,7 @@ if (typeof window !== "undefined") {
 }
 
 
-export const networks = {
-  testnet: {
-    networkPassphrase: "Test SDF Network ; September 2015",
-    contractId: "CCMKJGCCNCUFPPDBFIVF6TMFGF5N6KEAHORXDTS7VZKPUIFBAIUJLB34",
-  }
-} as const
+
 
 
 export interface Game {
@@ -63,8 +58,7 @@ export const Errors = {
   5: {message:"AlreadyCommitted"},
   6: {message:"NotYourTurn"},
   7: {message:"InvalidTurn"},
-  8: {message:"InvalidImageId"},
-  9: {message:"InvalidJournalHash"},
+  8: {message:"InvalidPublicInputs"},
   10: {message:"ProofVerificationFailed"},
   11: {message:"TimeoutNotReached"},
   12: {message:"InvalidDistance"},
@@ -81,7 +75,7 @@ export interface Lobby {
   host_points: i128;
 }
 
-export type DataKey = {tag: "Game", values: readonly [u32]} | {tag: "Lobby", values: readonly [u32]} | {tag: "GameHubAddress", values: void} | {tag: "Admin", values: void} | {tag: "VerifierId", values: void} | {tag: "PingImageId", values: void};
+export type DataKey = {tag: "Game", values: readonly [u32]} | {tag: "Lobby", values: readonly [u32]} | {tag: "GameHubAddress", values: void} | {tag: "Admin", values: void} | {tag: "VerifierId", values: void};
 
 export enum GameStatus {
   Created = 0,
@@ -151,20 +145,20 @@ export interface Client {
 
   /**
    * Construct and simulate a submit_ping transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Submit a ping result with ZK proof verification.
+   * Submit a ping result with ZK proof verification (Noir + UltraHonk).
    * 
-   * The pinging player sends a coordinate to the responder off-chain.
-   * The responder computes the Manhattan distance and generates a ZK proof.
-   * This method verifies the proof and records the distance.
+   * The pinger sends partial offsets to the responder:
+   * partial_dx = (ping_x - pinger_secret_x) mod 100
+   * partial_dy = (ping_y - pinger_secret_y) mod 100
    * 
-   * Journal layout: [session_id(4) || turn(4) || distance(4) || commitment(32)] = 44 bytes LE
+   * The responder proves:
+   * - their secret matches their commitment
+   * - distance(partial, responder_secret) == expected_distance
+   * 
+   * Public inputs layout (6 x 32-byte big-endian field elements):
+   * [session_id, turn, partial_dx, partial_dy, responder_commitment, expected_distance]
    */
-  submit_ping: ({session_id, player, turn, distance, x, y, journal_hash, image_id, seal}: {session_id: u32, player: string, turn: u32, distance: u32, x: u32, y: u32, journal_hash: Buffer, image_id: Buffer, seal: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Option<string>>>>
-
-  /**
-   * Construct and simulate a set_image_id transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   */
-  set_image_id: ({new_image_id}: {new_image_id: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<null>>
+  submit_ping: ({session_id, player, turn, distance, partial_dx, partial_dy, proof, public_inputs}: {session_id: u32, player: string, turn: u32, distance: u32, partial_dx: u32, partial_dy: u32, proof: Buffer, public_inputs: Array<Buffer>}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Option<string>>>>
 
   /**
    * Construct and simulate a set_verifier transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -173,8 +167,8 @@ export interface Client {
 
   /**
    * Construct and simulate a commit_secret transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Submit a SHA-256 commitment of the player's secret coordinates.
-   * commitment = SHA256(x_le || y_le || salt)   (4 + 4 + 32 = 40 bytes)
+   * Submit a Poseidon2 commitment of the player's secret coordinates.
+   * commitment = Poseidon2(x, y, salt) — 32 bytes big-endian
    */
   commit_secret: ({session_id, player, commitment}: {session_id: u32, player: string, commitment: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
@@ -188,7 +182,7 @@ export interface Client {
 export class Client extends ContractClient {
   static async deploy<T = Client>(
         /** Constructor/Initialization Args for the contract's `__constructor` method */
-        {admin, game_hub, verifier_id, ping_image_id}: {admin: string, game_hub: string, verifier_id: string, ping_image_id: Buffer},
+        {admin, game_hub, verifier_id}: {admin: string, game_hub: string, verifier_id: string},
     /** Options for initializing a Client as well as for calling a method, with extras specific to deploying. */
     options: MethodOptions &
       Omit<ContractClientOptions, "contractId"> & {
@@ -200,14 +194,14 @@ export class Client extends ContractClient {
         format?: "hex" | "base64";
       }
   ): Promise<AssembledTransaction<T>> {
-    return ContractClient.deploy({admin, game_hub, verifier_id, ping_image_id}, options)
+    return ContractClient.deploy({admin, game_hub, verifier_id}, options)
   }
   constructor(public readonly options: ContractClientOptions) {
     super(
       new ContractSpec([ "AAAAAQAAAAAAAAAAAAAABEdhbWUAAAANAAAAAAAAAAtjb21taXRtZW50MQAAAAPuAAAAIAAAAAAAAAALY29tbWl0bWVudDIAAAAD7gAAACAAAAAAAAAADGN1cnJlbnRfdHVybgAAAAQAAAAAAAAAEmxhc3RfYWN0aW9uX2xlZGdlcgAAAAAABAAAAAAAAAAHcGxheWVyMQAAAAATAAAAAAAAABVwbGF5ZXIxX2Jlc3RfZGlzdGFuY2UAAAAAAAAEAAAAAAAAAA5wbGF5ZXIxX3BvaW50cwAAAAAACwAAAAAAAAAHcGxheWVyMgAAAAATAAAAAAAAABVwbGF5ZXIyX2Jlc3RfZGlzdGFuY2UAAAAAAAAEAAAAAAAAAA5wbGF5ZXIyX3BvaW50cwAAAAAACwAAAAAAAAAGc3RhdHVzAAAAAAfQAAAACkdhbWVTdGF0dXMAAAAAAAAAAAAKd2hvc2VfdHVybgAAAAAABAAAAAAAAAAGd2lubmVyAAAAAAPoAAAAEw==",
-        "AAAABAAAAAAAAAAAAAAABUVycm9yAAAAAAAAEAAAAAAAAAAMR2FtZU5vdEZvdW5kAAAAAQAAAAAAAAAJTm90UGxheWVyAAAAAAAAAgAAAAAAAAAQR2FtZUFscmVhZHlFbmRlZAAAAAMAAAAAAAAAEUludmFsaWRHYW1lU3RhdHVzAAAAAAAABAAAAAAAAAAQQWxyZWFkeUNvbW1pdHRlZAAAAAUAAAAAAAAAC05vdFlvdXJUdXJuAAAAAAYAAAAAAAAAC0ludmFsaWRUdXJuAAAAAAcAAAAAAAAADkludmFsaWRJbWFnZUlkAAAAAAAIAAAAAAAAABJJbnZhbGlkSm91cm5hbEhhc2gAAAAAAAkAAAAAAAAAF1Byb29mVmVyaWZpY2F0aW9uRmFpbGVkAAAAAAoAAAAAAAAAEVRpbWVvdXROb3RSZWFjaGVkAAAAAAAACwAAAAAAAAAPSW52YWxpZERpc3RhbmNlAAAAAAwAAAAAAAAAD01heFR1cm5zUmVhY2hlZAAAAAANAAAAAAAAAA1Mb2JieU5vdEZvdW5kAAAAAAAADgAAAAAAAAASTG9iYnlBbHJlYWR5RXhpc3RzAAAAAAAPAAAAAAAAAAhTZWxmUGxheQAAABA=",
+        "AAAABAAAAAAAAAAAAAAABUVycm9yAAAAAAAADwAAAAAAAAAMR2FtZU5vdEZvdW5kAAAAAQAAAAAAAAAJTm90UGxheWVyAAAAAAAAAgAAAAAAAAAQR2FtZUFscmVhZHlFbmRlZAAAAAMAAAAAAAAAEUludmFsaWRHYW1lU3RhdHVzAAAAAAAABAAAAAAAAAAQQWxyZWFkeUNvbW1pdHRlZAAAAAUAAAAAAAAAC05vdFlvdXJUdXJuAAAAAAYAAAAAAAAAC0ludmFsaWRUdXJuAAAAAAcAAAAAAAAAE0ludmFsaWRQdWJsaWNJbnB1dHMAAAAACAAAAAAAAAAXUHJvb2ZWZXJpZmljYXRpb25GYWlsZWQAAAAACgAAAAAAAAARVGltZW91dE5vdFJlYWNoZWQAAAAAAAALAAAAAAAAAA9JbnZhbGlkRGlzdGFuY2UAAAAADAAAAAAAAAAPTWF4VHVybnNSZWFjaGVkAAAAAA0AAAAAAAAADUxvYmJ5Tm90Rm91bmQAAAAAAAAOAAAAAAAAABJMb2JieUFscmVhZHlFeGlzdHMAAAAAAA8AAAAAAAAACFNlbGZQbGF5AAAAEA==",
         "AAAAAQAAAAAAAAAAAAAABUxvYmJ5AAAAAAAAAwAAAAAAAAAOY3JlYXRlZF9sZWRnZXIAAAAAAAQAAAAAAAAABGhvc3QAAAATAAAAAAAAAAtob3N0X3BvaW50cwAAAAAL",
-        "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAABgAAAAEAAAAAAAAABEdhbWUAAAABAAAABAAAAAEAAAAAAAAABUxvYmJ5AAAAAAAAAQAAAAQAAAAAAAAAAAAAAA5HYW1lSHViQWRkcmVzcwAAAAAAAAAAAAAAAAAFQWRtaW4AAAAAAAAAAAAAAAAAAApWZXJpZmllcklkAAAAAAAAAAAAAAAAAAtQaW5nSW1hZ2VJZAA=",
+        "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAABQAAAAEAAAAAAAAABEdhbWUAAAABAAAABAAAAAEAAAAAAAAABUxvYmJ5AAAAAAAAAQAAAAQAAAAAAAAAAAAAAA5HYW1lSHViQWRkcmVzcwAAAAAAAAAAAAAAAAAFQWRtaW4AAAAAAAAAAAAAAAAAAApWZXJpZmllcklkAAA=",
         "AAAAAwAAAAAAAAAAAAAACkdhbWVTdGF0dXMAAAAAAAUAAAAAAAAAB0NyZWF0ZWQAAAAAAAAAAAAAAAAKQ29tbWl0dGluZwAAAAAAAQAAAAAAAAAGQWN0aXZlAAAAAAACAAAAAAAAAAlDb21wbGV0ZWQAAAAAAAADAAAAAAAAAAdUaW1lb3V0AAAAAAQ=",
         "AAAAAAAAAAAAAAAHZ2V0X2h1YgAAAAAAAAAAAQAAABM=",
         "AAAAAAAAAAAAAAAHc2V0X2h1YgAAAAABAAAAAAAAAAduZXdfaHViAAAAABMAAAAA",
@@ -219,11 +213,10 @@ export class Client extends ContractClient {
         "AAAAAAAAAJNPcGVuIGEgbG9iYnkgZm9yIGEgZ2FtZSBzZXNzaW9uLiBQbGF5ZXIgMSBjcmVhdGVzIGl0IHdpdGggYSByb29tIGNvZGUgKHNlc3Npb25faWQpLgpUaGlzIGlzIHNpbmdsZS1zaWcgYW5kIGRvZXMgbm90IHJlcXVpcmUgdGhlIG9wcG9uZW50J3MgYWRkcmVzcy4AAAAACW9wZW5fZ2FtZQAAAAAAAAMAAAAAAAAACnNlc3Npb25faWQAAAAAAAQAAAAAAAAABGhvc3QAAAATAAAAAAAAAAtob3N0X3BvaW50cwAAAAALAAAAAQAAA+kAAAACAAAAAw==",
         "AAAAAAAAAAAAAAAJc2V0X2FkbWluAAAAAAAAAQAAAAAAAAAJbmV3X2FkbWluAAAAAAAAEwAAAAA=",
         "AAAAAAAAAC1TdGFydCBhIG5ldyBnYW1lIHNlc3Npb24gYmV0d2VlbiB0d28gcGxheWVycy4AAAAAAAAKc3RhcnRfZ2FtZQAAAAAABQAAAAAAAAAKc2Vzc2lvbl9pZAAAAAAABAAAAAAAAAAHcGxheWVyMQAAAAATAAAAAAAAAAdwbGF5ZXIyAAAAABMAAAAAAAAADnBsYXllcjFfcG9pbnRzAAAAAAALAAAAAAAAAA5wbGF5ZXIyX3BvaW50cwAAAAAACwAAAAEAAAPpAAAAAgAAAAM=",
-        "AAAAAAAAAU9TdWJtaXQgYSBwaW5nIHJlc3VsdCB3aXRoIFpLIHByb29mIHZlcmlmaWNhdGlvbi4KClRoZSBwaW5naW5nIHBsYXllciBzZW5kcyBhIGNvb3JkaW5hdGUgdG8gdGhlIHJlc3BvbmRlciBvZmYtY2hhaW4uClRoZSByZXNwb25kZXIgY29tcHV0ZXMgdGhlIE1hbmhhdHRhbiBkaXN0YW5jZSBhbmQgZ2VuZXJhdGVzIGEgWksgcHJvb2YuClRoaXMgbWV0aG9kIHZlcmlmaWVzIHRoZSBwcm9vZiBhbmQgcmVjb3JkcyB0aGUgZGlzdGFuY2UuCgpKb3VybmFsIGxheW91dDogW3Nlc3Npb25faWQoNCkgfHwgdHVybig0KSB8fCBkaXN0YW5jZSg0KSB8fCBjb21taXRtZW50KDMyKV0gPSA0NCBieXRlcyBMRQAAAAALc3VibWl0X3BpbmcAAAAACQAAAAAAAAAKc2Vzc2lvbl9pZAAAAAAABAAAAAAAAAAGcGxheWVyAAAAAAATAAAAAAAAAAR0dXJuAAAABAAAAAAAAAAIZGlzdGFuY2UAAAAEAAAAAAAAAAF4AAAAAAAABAAAAAAAAAABeQAAAAAAAAQAAAAAAAAADGpvdXJuYWxfaGFzaAAAA+4AAAAgAAAAAAAAAAhpbWFnZV9pZAAAA+4AAAAgAAAAAAAAAARzZWFsAAAADgAAAAEAAAPpAAAD6AAAABMAAAAD",
-        "AAAAAAAAAAAAAAAMc2V0X2ltYWdlX2lkAAAAAQAAAAAAAAAMbmV3X2ltYWdlX2lkAAAD7gAAACAAAAAA",
+        "AAAAAAAAAeRTdWJtaXQgYSBwaW5nIHJlc3VsdCB3aXRoIFpLIHByb29mIHZlcmlmaWNhdGlvbiAoTm9pciArIFVsdHJhSG9uaykuCgpUaGUgcGluZ2VyIHNlbmRzIHBhcnRpYWwgb2Zmc2V0cyB0byB0aGUgcmVzcG9uZGVyOgpwYXJ0aWFsX2R4ID0gKHBpbmdfeCAtIHBpbmdlcl9zZWNyZXRfeCkgbW9kIDEwMApwYXJ0aWFsX2R5ID0gKHBpbmdfeSAtIHBpbmdlcl9zZWNyZXRfeSkgbW9kIDEwMAoKVGhlIHJlc3BvbmRlciBwcm92ZXM6Ci0gdGhlaXIgc2VjcmV0IG1hdGNoZXMgdGhlaXIgY29tbWl0bWVudAotIGRpc3RhbmNlKHBhcnRpYWwsIHJlc3BvbmRlcl9zZWNyZXQpID09IGV4cGVjdGVkX2Rpc3RhbmNlCgpQdWJsaWMgaW5wdXRzIGxheW91dCAoNiB4IDMyLWJ5dGUgYmlnLWVuZGlhbiBmaWVsZCBlbGVtZW50cyk6CltzZXNzaW9uX2lkLCB0dXJuLCBwYXJ0aWFsX2R4LCBwYXJ0aWFsX2R5LCByZXNwb25kZXJfY29tbWl0bWVudCwgZXhwZWN0ZWRfZGlzdGFuY2VdAAAAC3N1Ym1pdF9waW5nAAAAAAgAAAAAAAAACnNlc3Npb25faWQAAAAAAAQAAAAAAAAABnBsYXllcgAAAAAAEwAAAAAAAAAEdHVybgAAAAQAAAAAAAAACGRpc3RhbmNlAAAABAAAAAAAAAAKcGFydGlhbF9keAAAAAAABAAAAAAAAAAKcGFydGlhbF9keQAAAAAABAAAAAAAAAAFcHJvb2YAAAAAAAAOAAAAAAAAAA1wdWJsaWNfaW5wdXRzAAAAAAAD6gAAA+4AAAAgAAAAAQAAA+kAAAPoAAAAEwAAAAM=",
         "AAAAAAAAAAAAAAAMc2V0X3ZlcmlmaWVyAAAAAQAAAAAAAAAMbmV3X3ZlcmlmaWVyAAAAEwAAAAA=",
-        "AAAAAAAAABhJbml0aWFsaXplIHRoZSBjb250cmFjdC4AAAANX19jb25zdHJ1Y3RvcgAAAAAAAAQAAAAAAAAABWFkbWluAAAAAAAAEwAAAAAAAAAIZ2FtZV9odWIAAAATAAAAAAAAAAt2ZXJpZmllcl9pZAAAAAATAAAAAAAAAA1waW5nX2ltYWdlX2lkAAAAAAAD7gAAACAAAAAA",
-        "AAAAAAAAAINTdWJtaXQgYSBTSEEtMjU2IGNvbW1pdG1lbnQgb2YgdGhlIHBsYXllcidzIHNlY3JldCBjb29yZGluYXRlcy4KY29tbWl0bWVudCA9IFNIQTI1Nih4X2xlIHx8IHlfbGUgfHwgc2FsdCkgICAoNCArIDQgKyAzMiA9IDQwIGJ5dGVzKQAAAAANY29tbWl0X3NlY3JldAAAAAAAAAMAAAAAAAAACnNlc3Npb25faWQAAAAAAAQAAAAAAAAABnBsYXllcgAAAAAAEwAAAAAAAAAKY29tbWl0bWVudAAAAAAD7gAAACAAAAABAAAD6QAAAAIAAAAD",
+        "AAAAAAAAABhJbml0aWFsaXplIHRoZSBjb250cmFjdC4AAAANX19jb25zdHJ1Y3RvcgAAAAAAAAMAAAAAAAAABWFkbWluAAAAAAAAEwAAAAAAAAAIZ2FtZV9odWIAAAATAAAAAAAAAAt2ZXJpZmllcl9pZAAAAAATAAAAAA==",
+        "AAAAAAAAAHxTdWJtaXQgYSBQb3NlaWRvbjIgY29tbWl0bWVudCBvZiB0aGUgcGxheWVyJ3Mgc2VjcmV0IGNvb3JkaW5hdGVzLgpjb21taXRtZW50ID0gUG9zZWlkb24yKHgsIHksIHNhbHQpIOKAlCAzMiBieXRlcyBiaWctZW5kaWFuAAAADWNvbW1pdF9zZWNyZXQAAAAAAAADAAAAAAAAAApzZXNzaW9uX2lkAAAAAAAEAAAAAAAAAAZwbGF5ZXIAAAAAABMAAAAAAAAACmNvbW1pdG1lbnQAAAAAA+4AAAAgAAAAAQAAA+kAAAACAAAAAw==",
         "AAAAAAAAADFGb3JjZSBhIHRpbWVvdXQgd2luIGlmIHRoZSBvcHBvbmVudCBoYXMgYmVlbiBBRksuAAAAAAAADWZvcmNlX3RpbWVvdXQAAAAAAAACAAAAAAAAAApzZXNzaW9uX2lkAAAAAAAEAAAAAAAAAAZwbGF5ZXIAAAAAABMAAAABAAAD6QAAABMAAAAD" ]),
       options
     )
@@ -240,7 +233,6 @@ export class Client extends ContractClient {
         set_admin: this.txFromJSON<null>,
         start_game: this.txFromJSON<Result<void>>,
         submit_ping: this.txFromJSON<Result<Option<string>>>,
-        set_image_id: this.txFromJSON<null>,
         set_verifier: this.txFromJSON<null>,
         commit_secret: this.txFromJSON<Result<void>>,
         force_timeout: this.txFromJSON<Result<string>>

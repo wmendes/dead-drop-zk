@@ -18,16 +18,29 @@ Inputs reviewed:
 
 ## 1. Executive Summary
 
-The codebase has a solid Dead Drop contract core (state machine, commit flow, turn progression, timeout, hub integration) and passing unit tests, but the game is still in a mock-dev state for the most critical production areas:
+**Last updated: 2026-02-14** (post-Noir refactor)
 
-1. ZK proving path is not implemented end-to-end (frontend submits mock data, deployment uses mock verifier).
-2. Multiplayer off-chain protocol is not implemented (no WebRTC/auto-responder).
-3. Wallet UX in active app path is dev-only.
-4. Passkey/smart-account integration is not yet implemented.
-5. Reveal/gadget mechanics from the implementation plan are not yet in contract/frontend.
+The codebase has completed the core ZK and P2P layers. The game is now past mock-dev for proving:
 
-This plan prioritizes a production-safe vertical slice first:
-`real proof generation -> real verifier -> trustless ping submission -> two-browser gameplay -> passkey/smart accounts`.
+**DONE:**
+1. ZK proving path: Noir circuit (`circuits/dead_drop/`) + client-side UltraHonk proving via `@aztec/bb.js`. No backend prover required — all proving runs in-browser via WASM.
+2. Commitment scheme: `Poseidon2(x, y, salt)` via `@zkpassport/poseidon2` — matches Noir circuit exactly.
+3. P2P transport: WebRTC peer service + Session Push relay for proof request/response exchange.
+4. Lobby system: `open_game` (single-sig, room code) + `join_game` (single-sig, triggers Game Hub).
+5. Sound engine: ambient loop + gameplay sounds via Tone.js.
+
+**Remaining P0s (blocking production):**
+1. On-chain UltraHonk verifier not yet deployed on Testnet — `submit_ping` still uses mock verifier.
+2. Frontend `submit_ping` path still uses mock proof artifacts — must be wired to `deadDropNoirService.provePingNoir()`.
+3. Relay backend not deployed in production (local only).
+
+**Remaining P1s:**
+4. Reveal phase not yet in contract or frontend.
+5. Passkey / Smart Account integration not yet implemented.
+6. Auto-responder E2E (WebRTC prove-and-return loop) not fully tested across two real browsers.
+
+This plan continues to prioritize the production vertical slice:
+`real Noir proof → on-chain UltraHonk verifier → trustless ping submission → two-browser gameplay → passkey/smart accounts`.
 
 ---
 
@@ -158,13 +171,33 @@ Current state:
 
 ## 4. Target Architecture (Implementation End State)
 
-1. On-chain contract verifies real ZK proofs for each ping submission.
-2. Backend proving service generates proof artifacts from canonical inputs and prepends verifier selector when required.
-3. Browser-to-browser game loop uses P2P signaling + data channel for ping requests/responses (with fallback transport).
+```
+Pinger browser                Responder browser
+─────────────────             ──────────────────────────────────
+1. Send PING_REQUEST ──────→  2. Receive ping_x, ping_y
+                              3. Run provePingNoir() [Noir + bb.js WASM]
+                              4. Return proof + public_inputs
+5. Receive proof ←────────────
+6. Call submit_ping on Dead Drop contract
+        │
+        ▼
+   Dead Drop Contract (Soroban)
+        │  verifies public inputs schema
+        │  calls UltraHonk Verifier contract
+        ▼
+   UltraHonk Verifier (on-chain)
+        │  checks UltraHonk proof
+        ▼
+   Ledger state updated, "ping" event emitted
+```
+
+1. On-chain contract verifies real Noir UltraHonk proofs for each ping submission.
+2. **No backend prover** — all proving runs client-side in-browser via WASM (`@aztec/bb.js`).
+3. Browser-to-browser game loop uses WebRTC DataChannel + Session Push relay fallback for proof request/response.
 4. Frontend wallet layer supports:
-- dev wallets (local testing)
-- standard wallet kit
-- passkey smart accounts via `smart-account-kit`
+   - dev wallets (local testing)
+   - standard wallet kit (Freighter etc.)
+   - passkey smart accounts via `smart-account-kit`
 5. Reveal phase finalizes end-state integrity.
 6. Docs/runbooks provide deterministic setup + troubleshooting + demo path.
 
@@ -198,47 +231,41 @@ Exit criteria:
 - `cargo test -p dead-drop` green with new cases.
 - No panic-based proof failures on invalid seal.
 
-## Workstream B (P0): Real RiscZero Ping Proving Stack
+## Workstream B (P0): Wire Frontend to Real Noir Proof [PARTIALLY DONE]
 
-Goal: replace mock proof artifacts with real `seal/image_id/journal_hash`.
+**Status:** Noir circuit + proving service are implemented. Frontend wiring is pending.
 
-Tasks:
-1. Scaffold `risc0/dead_drop_proof` from `typezero-reference/risc0/typing_proof`.
-2. Implement guest logic for Dead Drop ping statement.
-3. Implement host crate that outputs normalized proof artifacts.
-4. Add backend proving service (`/prove/ping`) modeled on `typezero-reference/backend`.
-5. Implement selector prefixing (`VERIFIER_SELECTOR_HEX`) exactly once in backend output path.
+Goal: replace mock proof artifacts with real Noir UltraHonk proof + public inputs.
 
-Recommended directory layout:
-- `risc0/dead_drop_proof/methods/guest/`
-- `risc0/dead_drop_proof/host/`
-- `backend/` (or `dead-drop-backend/`)
+**DONE:**
+- `circuits/dead_drop/` — Noir circuit verifying Poseidon2 commitment + wrapped Manhattan distance.
+- `deadDropNoirService.ts` — `provePingNoir()` generates proof entirely in-browser.
+- `computeCommitmentNoir()` — Poseidon2 commitment matches circuit exactly.
+- Bug fix: `UltraHonkBackend` now receives `circuit.bytecode` (not full JSON object).
 
-Proof input/output contract (v1):
-- Inputs:
-  - `session_id`, `turn`, ping coordinate data (or canonical offset data), responder secret + salt, expected responder commitment
-- Journal/public outputs:
-  - fields required by contract hash reconstruction (must match contract schema exactly)
-- Output API:
-  - `distance`, `journal_sha256_hex`, `image_id_hex`, `seal_hex`
+**Remaining tasks:**
+1. Wire `DeadDropGame.tsx handleSubmitPing` to call `provePingNoir()`.
+2. Pass `proof` (bytes) + `public_inputs` (6 × 32-byte BE field elements) to `deadDropService.submitPing()`.
+3. Remove mock distance / `MOCK_IMAGE_ID` / dummy seal from frontend.
+4. Deploy on-chain UltraHonk verifier contract and wire to dead-drop constructor.
 
-Tests to add:
-- host deterministic output tests
-- backend `/prove/ping` contract tests
-- fixture-based end-to-end local proof generation
+Public inputs schema (6 × 32-byte BE field elements):
+```
+[session_id, turn, ping_x, ping_y, expected_commitment, expected_distance]
+```
 
 Exit criteria:
-- local command can generate proof accepted by `dead-drop` contract with non-mock verifier stub replacement flow.
+- Local frontend can generate a real proof and have it accepted by the on-chain UltraHonk verifier.
 
-## Workstream C (P0): Deploy Pipeline for Real Verifier Mode
+## Workstream C (P0): Deploy UltraHonk Verifier + Wire Contract
 
-Goal: support real verifier deployment/configuration without manual ad-hoc steps.
+Goal: replace mock-verifier deployment with real on-chain UltraHonk verifier.
 
 Tasks:
-1. Add deploy mode switch (`mock` vs `real`) in `scripts/deploy.ts`.
-2. Accept `VERIFIER_CONTRACT_ID`, `PING_IMAGE_ID_HEX`, `VERIFIER_SELECTOR_HEX` from env/config.
-3. Persist these values into `deployment.json` and frontend runtime config.
-4. Keep backward-compatible mock mode for local/dev.
+1. Obtain / deploy Barretenberg UltraHonk verifier contract on Testnet.
+2. Update `scripts/deploy.ts` to pass real verifier address as `verifier_id` constructor arg.
+3. Persist verifier contract ID into `deployment.json` and frontend runtime config.
+4. Keep backward-compatible mock mode for local/dev (existing `mock-verifier`).
 
 Code touchpoints:
 - `scripts/deploy.ts`
@@ -247,6 +274,7 @@ Code touchpoints:
 
 Exit criteria:
 - one documented command path for mock mode and one for real-verifier mode.
+- `submit_ping` with a real Noir proof succeeds against the on-chain UltraHonk verifier.
 
 ## Workstream D (P1): Frontend Trustless Ping Flow
 
@@ -325,7 +353,44 @@ Code touchpoints:
 Exit criteria:
 - production path can play full game with passkey-backed smart account and no dev secrets.
 
-## Workstream G (P1): Reveal Phase
+## Workstream G (P0): OpenZeppelin Relayer Integration
+
+Reference:
+- `https://developers.stellar.org/docs/tools/openzeppelin-relayer`
+
+Goal: production-safe sponsored transaction submission without client-held fee-payer secrets.
+
+Tasks:
+1. Add backend relayer adapter using `@openzeppelin/relayer-plugin-channels`:
+- `POST /tx/submit` accepts `func_xdr` + `auth_entries_xdr`
+- calls `submitSorobanTransaction`
+- polls RPC for transaction final status
+2. Add frontend submission mode switch:
+- `VITE_DEAD_DROP_RELAYER_URL` enables relayer path
+- fallback remains direct `signAndSend` for local/dev
+3. Ensure auth-entry signing remains in browser (passkey), while envelope/source signing happens in relayer.
+4. Add relayer-side validation and abuse controls:
+- allowed contract IDs/functions
+- auth entry count/size bounds
+- rate limits and request correlation IDs
+5. Add env/runbook:
+- `OZ_RELAYER_API_KEY`
+- `OZ_RELAYER_BASE_URL`
+- relayer URL propagation in setup/deploy/publish/runtime config
+
+Code touchpoints:
+- `backend/dead-drop-prover/server.js`
+- `backend/dead-drop-prover/relayer.js`
+- `dead-drop-frontend/src/utils/transactionHelper.ts`
+- `dead-drop-frontend/src/utils/constants.ts`
+- `scripts/deploy.ts`
+- `scripts/setup.ts`
+- `scripts/publish.ts`
+
+Exit criteria:
+- frontend gameplay actions can be submitted via relayer with no client fee-payer secret.
+
+## Workstream H (P1): Reveal Phase
 
 Goal: align with implementation plan’s end-game reveal and integrity guarantees.
 
@@ -341,7 +406,7 @@ Tasks:
 Exit criteria:
 - final winner can be cryptographically explained from reveals where required by game mode.
 
-## Workstream H (P2): Gadgets
+## Workstream I (P2): Gadgets
 
 Goal: implement minimum viable gadget system (Sat-Link + Intercept).
 
@@ -354,7 +419,7 @@ Tasks:
 Exit criteria:
 - both gadgets usable in full game and validated by contract rules.
 
-## Workstream I (P2): Documentation and Demo Packaging
+## Workstream J (P2): Documentation and Demo Packaging
 
 Tasks:
 1. Rewrite `contracts/dead-drop/README.md` to match actual game.
@@ -466,22 +531,28 @@ Go/No-Go criteria:
 
 ## 9. Immediate Next Implementation Steps (Actionable)
 
-1. Implement Workstream A (contract hardening + tests) first.
-2. Scaffold `risc0/dead_drop_proof` and backend `/prove/ping` from typezero reference patterns.
-3. Replace `handleSubmitPing` mock path with proof-backed path.
-4. Add deploy real-mode config flags and selector/image handling.
-5. Introduce wallet adapter layer, then integrate `smart-account-kit` passkey adapter.
+1. **Wire `submit_ping` to real Noir proof** (Workstream B):
+   - Call `provePingNoir()` in `DeadDropGame.tsx handleSubmitPing`.
+   - Remove mock distance / dummy seal.
+2. **Deploy on-chain UltraHonk verifier** (Workstream C):
+   - Deploy verifier contract on Testnet.
+   - Update `scripts/deploy.ts` and `deployment.json`.
+3. **Run E2E test**: real proof → `submit_ping` → on-chain verify.
+4. **Deploy relay backend** (Workstream G): expose `POST /tx/submit` and proof-request routing in production.
+5. **Test auto-responder E2E** (Workstream E): two separate browsers, responder proves and returns proof.
+6. **Reveal phase** (Workstream H): `reveal_secret` contract method + frontend settlement UX.
 
 ---
 
 ## 10. Validation Snapshot (Current)
 
-Executed during this review:
-- `cargo test -p dead-drop --quiet`: pass (21/21)
+Last validated: 2026-02-14
+
+- `cargo test -p dead-drop --quiet`: pass (26/26)
+- `bun run build dead-drop`: pass
 - `bun run build` in `dead-drop-frontend`: pass
 
 Current warnings to account for:
 - deprecated Soroban event publish usage in contract
-- large frontend JS bundle warning
-- static asset resolution warnings in Vite build
-
+- large frontend JS bundle (expected — bb.js WASM)
+- static asset resolution warnings in Vite build (circuit JSON import)

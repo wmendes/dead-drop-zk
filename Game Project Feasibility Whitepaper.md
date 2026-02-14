@@ -153,6 +153,8 @@ This is the core gameplay loop. Players alternate turns making **Blind Pings**.
 2. A computes their **partial offset**: `Da = (Gx - Xa, Gy - Ya)` — this reveals nothing about `Sa` to B because B doesn't know `G`.
 3. A sends `Da` to B via WebRTC (encrypted channel).
 
+**Privacy invariant:** `Da` is a transport artifact, not a renderable map coordinate. During active play, opponent ping coordinates must be treated as unknown and never displayed as exact points.
+
 **Agent B's Auto-Response:**
 
 4. B's client receives `Da` and automatically computes:
@@ -181,6 +183,7 @@ This is the core gameplay loop. Players alternate turns making **Blind Pings**.
 - Records the verified distance and advances the turn counter
 
 **Agent A sees the result:** `distance = 15` → "WARM (15 grid steps away)"
+Only this verified distance/zone feedback is revealed; opponent exact ping coordinates remain hidden.
 
 **Temperature Zones:**
 | Distance | Zone | UI Feedback |
@@ -515,6 +518,8 @@ interface PingResponse {
 }
 ```
 
+`partial_dx` and `partial_dy` are protocol values used for proof generation and verification. They are not world coordinates and must not be rendered as exact opponent markers in the UI.
+
 ### 7.3 Auto-Responder
 
 The responding player's browser runs a background worker that:
@@ -547,6 +552,8 @@ This happens without manual intervention — the player just watches the distanc
 - B does NOT know `Xa` or `Ya`, so B cannot determine `Gx` or `Gy`
 - B DOES learn the distance result (they compute it)
 - Over multiple pings, B can observe the distance values but cannot triangulate A's guesses without knowing `Sa`
+- B should not receive or store A's secret share in local runtime state
+- Therefore, B cannot reconstruct A's exact ping coordinate during active play; UI must show uncertainty instead of a point
 
 **What a blockchain observer learns:**
 - Verified distances for each turn
@@ -602,6 +609,14 @@ Following TypeZero's security model:
 - "CLASSIFIED" watermarks on game state
 - Sound effects: radar beep (ping sent), sonar ping (distance received), alarm (HOT zone)
 - Distance visualization: concentric rings on the map showing temperature zones
+- Opponent pings render as a "classified uncertainty overlay" (no exact coordinate marker)
+
+### 9.3 Coordinate Visibility Rules
+
+- Your own pings: exact coordinates can be rendered locally after decoding with your own secret.
+- Opponent pings: coordinate remains unknown by design; only distance/temperature feedback is shown.
+- If the UI receives `partial_dx/dy`, it must treat them as non-display protocol values.
+- Exact opponent coordinates can only appear after an explicit post-game reveal policy.
 
 ---
 
@@ -646,6 +661,8 @@ Following TypeZero's security model:
 - [ ] Build the Auto-Responder: background worker that receives queries, calls proving service, returns responses
 - [ ] Implement the full turn loop: A guesses → B auto-responds → proof submitted → distance displayed → turn advances
 - [ ] Add the ping history panel and temperature zone visualization
+- [ ] Enforce "no opponent secret locally" in runtime state and rendering paths
+- [ ] Render opponent ping uncertainty overlay (instead of exact map markers)
 - [ ] Implement the reveal phase (game end, secret reveal, winner determination)
 - [ ] Implement `force_timeout()` for AFK protection
 
@@ -661,6 +678,7 @@ Following TypeZero's security model:
 - [ ] Implement at least Sat-Link (quadrant peek) and Intercept (learn opponent's distance)
 - [ ] Add `gadget_usage_mask` to contract to prevent reuse
 - [ ] Sound effects and visual polish (radar, temperature zones, spy theme)
+- [ ] Add clear UX copy/tooltips explaining why opponent coordinates are unknown
 - [ ] Handle edge cases: both players online/offline, reconnection, proof generation failures
 
 ### Phase 5: Demo & Documentation (Days 13-14)

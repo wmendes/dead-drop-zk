@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, Bytes, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, Bytes, BytesN, Env, Vec};
 
 #[contract]
 pub struct MockVerifier;
@@ -8,8 +8,16 @@ pub struct MockVerifier;
 #[contractimpl]
 impl MockVerifier {
     /// Always-accept verifier stub for development.
-    /// In production, swap for the Nethermind Groth16 verifier.
-    pub fn verify(_env: Env, _seal: Bytes, _image_id: BytesN<32>, _journal_hash: BytesN<32>) {
-        // Always passes
+    /// Matches the UltraHonk verifier interface:
+    ///   verify_proof(proof: Bytes, public_inputs: Vec<BytesN<32>>)
+    ///
+    /// In production, deploy the real UltraHonk verifier
+    /// (indextree/ultrahonk_soroban_contract) and point to its address.
+    pub fn verify_proof(
+        _env: Env,
+        _proof: Bytes,
+        _public_inputs: Vec<BytesN<32>>,
+    ) {
+        // Always passes — accepts any proof during development
     }
 }

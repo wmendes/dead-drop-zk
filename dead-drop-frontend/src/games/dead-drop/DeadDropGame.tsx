@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { DeadDropService } from './deadDropService';
 import { useWallet } from '@/hooks/useWallet';
 import { devWalletService } from '@/services/devWalletService';
-import { DEAD_DROP_CONTRACT } from '@/utils/constants';
+import { DEAD_DROP_CONTRACT, DEAD_DROP_PROVER_URL } from '@/utils/constants';
 import { getFundedSimulationSourceAddress } from '@/utils/simulationUtils';
 import { Buffer } from 'buffer';
 import type { Game } from './bindings';
@@ -14,11 +14,19 @@ import { ActionButton } from './components/ActionPanel';
 import { Loader2, Crosshair, History, Info, Target, Copy, Check, Volume2, VolumeX } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useSoundEngine } from './useSoundEngine';
+import { computeCommitmentNoir, provePingNoir } from './deadDropNoirService';
+import { provePing as provePingViaBackend } from './deadDropProofService';
+import {
+  type RelayProofArtifacts,
+} from './deadDropRelayService';
+import { DeadDropWebRtcPeer, type WebRtcPingRequest } from './deadDropWebRtcService';
+import { DeadDropSessionPushClient } from './deadDropSessionPushService';
 
 const GRID_SIZE = 100;
 const MAX_TURNS = 30;
 
 type TemperatureZone = 'FOUND' | 'HOT' | 'WARM' | 'COOL' | 'COLD';
+type CoordVisibility = 'exact' | 'unknown';
 
 interface PingResult {
   turn: number;
@@ -27,6 +35,7 @@ interface PingResult {
   distance: number;
   zone: TemperatureZone;
   player: string;
+  coordVisibility: CoordVisibility;
 }
 
 interface PlayerSecret {
@@ -54,24 +63,18 @@ function getZoneColor(zone: TemperatureZone): string {
 }
 
 async function computeCommitment(secret: PlayerSecret): Promise<Buffer> {
-  const data = new Uint8Array(40);
-  const view = new DataView(data.buffer);
-  view.setUint32(0, secret.x, true);
-  view.setUint32(4, secret.y, true);
-  data.set(secret.salt, 8);
-  const hash = await crypto.subtle.digest('SHA-256', data);
-  return Buffer.from(new Uint8Array(hash));
+  const hex = await computeCommitmentNoir(secret.x, secret.y, secret.salt);
+  return Buffer.from(hex, 'hex');
 }
 
-async function computeJournalHash(sessionId: number, turn: number, distance: number, commitment: Buffer): Promise<Buffer> {
-  const data = new Uint8Array(44);
-  const view = new DataView(data.buffer);
-  view.setUint32(0, sessionId, true);
-  view.setUint32(4, turn, true);
-  view.setUint32(8, distance, true);
-  data.set(commitment, 12);
-  const hash = await crypto.subtle.digest('SHA-256', data);
-  return Buffer.from(new Uint8Array(hash));
+/** Safely convert Soroban SDK commitment values to Buffer (handles various runtime shapes). */
+function toBuffer(v: any): Buffer {
+  if (Buffer.isBuffer(v)) return v;
+  if (v instanceof Uint8Array) return Buffer.from(v);
+  if (v?.type === 'Buffer' && Array.isArray(v.data)) return Buffer.from(v.data);
+  if (typeof v === 'string') return Buffer.from(v, 'hex');
+  if (Array.isArray(v)) return Buffer.from(v);
+  throw new Error(`Cannot convert commitment to Buffer: ${typeof v}`);
 }
 
 function generateSecret(): PlayerSecret {
@@ -80,12 +83,6 @@ function generateSecret(): PlayerSecret {
   const salt = new Uint8Array(32);
   crypto.getRandomValues(salt);
   return { x: coords[0] % GRID_SIZE, y: coords[1] % GRID_SIZE, salt };
-}
-
-function wrappedManhattan(px: number, py: number, dropX: number, dropY: number): number {
-  const dx = Math.abs(px - dropX);
-  const dy = Math.abs(py - dropY);
-  return Math.min(dx, GRID_SIZE - dx) + Math.min(dy, GRID_SIZE - dy);
 }
 
 function getOpponentSecret(sessionId: number, opponentAddress: string): PlayerSecret | null {
@@ -104,9 +101,29 @@ const createRandomSessionId = (): number => {
 };
 
 const deadDropService = new DeadDropService(DEAD_DROP_CONTRACT);
-const MOCK_IMAGE_ID = Buffer.alloc(32, 7);
 
 type GamePhase = 'create' | 'waiting_opponent' | 'commit' | 'waiting_commit' | 'my_turn' | 'opponent_turn' | 'game_over';
+
+function toErrorMessage(err: unknown, fallback: string): string {
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === 'string' && err) return err;
+  try {
+    const serialized = JSON.stringify(err);
+    if (serialized && serialized !== '{}') return serialized;
+  } catch {
+    // ignore
+  }
+  return fallback;
+}
+
+function isProverSchemaMismatchError(err: unknown): boolean {
+  const message = toErrorMessage(err, '').toLowerCase();
+  return message.includes('dead drop prover api mismatch')
+    || message.includes('a_x must be uint32')
+    || message.includes('b_x must be uint32')
+    || message.includes('commitment_a_hex')
+    || message.includes('commitment_b_hex');
+}
 
 interface DeadDropGameProps {
   userAddress: string;
@@ -144,6 +161,9 @@ export function DeadDropGame({
 
   const [selectedCell, setSelectedCell] = useState<{ x: number; y: number } | null>(null);
   const [showDebug, setShowDebug] = useState(false);
+  const [copiedCoords, setCopiedCoords] = useState(false);
+  const [manualOppX, setManualOppX] = useState('');
+  const [manualOppY, setManualOppY] = useState('');
 
   // Modals
   const [showHistoryModal, setShowHistoryModal] = useState(false);
@@ -153,8 +173,47 @@ export function DeadDropGame({
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: 'error' | 'success' | 'info'; id: string; duration?: number } | null>(null);
   const [copied, setCopied] = useState(false);
+  const [relayStatusMessage, setRelayStatusMessage] = useState<string | null>(null);
+  const [isWebRtcReady, setIsWebRtcReady] = useState(false);
 
   const actionLock = useRef(false);
+  const relayResponderBusy = useRef(false);
+  const missingSessionNotified = useRef(false);
+  const webRtcPeerRef = useRef<DeadDropWebRtcPeer | null>(null);
+  const sessionPushRef = useRef<DeadDropSessionPushClient | null>(null);
+  const pendingPushProofRequests = useRef<Map<string, {
+    resolve: (proof: RelayProofArtifacts) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>>(new Map());
+  const gameStateRef = useRef<Game | null>(null);
+  const gamePhaseRef = useRef<GamePhase>('create');
+  const playerSecretRef = useRef<PlayerSecret | null>(null);
+  const soundCallbacksRef = useRef({
+    playVictory: sound.playVictory,
+    playDefeat: sound.playDefeat,
+    playMyTurn: sound.playMyTurn,
+  });
+
+  useEffect(() => {
+    soundCallbacksRef.current = {
+      playVictory: sound.playVictory,
+      playDefeat: sound.playDefeat,
+      playMyTurn: sound.playMyTurn,
+    };
+  });
+
+  useEffect(() => {
+    gameStateRef.current = gameState;
+  }, [gameState]);
+
+  useEffect(() => {
+    gamePhaseRef.current = gamePhase;
+  }, [gamePhase]);
+
+  useEffect(() => {
+    playerSecretRef.current = playerSecret;
+  }, [playerSecret]);
 
   const showToast = (message: string, type: 'error' | 'success' | 'info', duration?: number) => {
     setToast({ message, type, id: crypto.randomUUID(), duration });
@@ -190,8 +249,8 @@ export function DeadDropGame({
     const emptyCommitment = Buffer.alloc(32, 0);
 
     const myCommitmentEmpty = isP1
-      ? Buffer.from(game.commitment1 as any).equals(emptyCommitment)
-      : Buffer.from(game.commitment2 as any).equals(emptyCommitment);
+      ? toBuffer(game.commitment1).equals(emptyCommitment)
+      : toBuffer(game.commitment2).equals(emptyCommitment);
 
     const isPreActive = game.status === GameStatus.Created || game.status === GameStatus.Committing;
     const isActive = game.status === GameStatus.Active;
@@ -205,103 +264,121 @@ export function DeadDropGame({
     return 'game_over';
   }, [userAddress]);
 
-  // Poll game state and events
-  useEffect(() => {
-    if (gamePhase === 'create') return;
-    let cancelled = false;
-    const load = async () => {
-      // While waiting for opponent to join the lobby, check if game has been created
-      if (gamePhase === 'waiting_opponent') {
-        const game = await deadDropService.getGame(sessionId).catch(() => null);
-        if (cancelled) return;
-        if (game) {
-          setGameState(game);
-          setGamePhase(derivePhase(game));
+  const mergePingEvents = useCallback((events: {
+    player: string;
+    turn: number;
+    distance: number;
+    x: number;
+    y: number;
+  }[]) => {
+    if (!events || events.length === 0) return;
+    setPingHistory(prev => {
+      const next = [...prev];
+      let changed = false;
+      for (const evt of events) {
+        const index = next.findIndex(p => p.turn === evt.turn);
+        const isOwnPing = evt.player === userAddress;
+        const playerSecret = isOwnPing ? playerSecretRef.current : null;
+        const hasExactCoords = !!playerSecret;
+        const resolvedX = playerSecret ? (evt.x + playerSecret.x) % GRID_SIZE : evt.x;
+        const resolvedY = playerSecret ? (evt.y + playerSecret.y) % GRID_SIZE : evt.y;
+        const coordVisibility: CoordVisibility = hasExactCoords ? 'exact' : 'unknown';
+        const entry = {
+          turn: evt.turn,
+          x: resolvedX,
+          y: resolvedY,
+          distance: evt.distance,
+          zone: getTemperatureZone(evt.distance),
+          player: evt.player,
+          coordVisibility,
+        };
+        if (index !== -1) {
+          if (
+            next[index].distance !== entry.distance
+            || next[index].x !== entry.x
+            || next[index].y !== entry.y
+            || next[index].player !== entry.player
+            || next[index].coordVisibility !== entry.coordVisibility
+          ) {
+            next[index] = entry;
+            changed = true;
+          }
+        } else {
+          next.push(entry);
+          changed = true;
         }
+      }
+      return changed ? next.sort((a, b) => a.turn - b.turn) : prev;
+    });
+  }, [userAddress]);
+
+  const resetMissingSessionState = useCallback(() => {
+    setGameState(null);
+    setPingHistory([]);
+    setSelectedCell(null);
+    setRelayStatusMessage(null);
+    setLoading(false);
+    setGamePhase('create');
+  }, []);
+
+  const syncFromChain = useCallback(async (reason: string) => {
+    const [game, events] = await Promise.all([
+      deadDropService.getGame(sessionId),
+      deadDropService.getPingEvents(sessionId).catch(() => [])
+    ]);
+
+    if (!game) {
+      if (gamePhaseRef.current === 'waiting_opponent') {
+        const lobby = await deadDropService.getLobby(sessionId).catch(() => null);
+        if (lobby) {
+          missingSessionNotified.current = false;
+          return;
+        }
+        if (!missingSessionNotified.current) {
+          showToast('Lobby expired or game not found. Returning to setup.', 'info', 2500);
+          missingSessionNotified.current = true;
+        }
+        resetMissingSessionState();
         return;
       }
 
-      const [game, events] = await Promise.all([
-        deadDropService.getGame(sessionId),
-        deadDropService.getPingEvents(sessionId).catch(() => [])
-      ]);
-
-      if (cancelled) return;
-
-      if (events && events.length > 0) {
-        setPingHistory(prev => {
-          const newHistory = [...prev];
-          let changed = false;
-          events.forEach(evt => {
-            const index = newHistory.findIndex(p => p.turn === evt.turn);
-            const newEntry = {
-              turn: evt.turn,
-              x: evt.x,
-              y: evt.y,
-              distance: evt.distance,
-              zone: getTemperatureZone(evt.distance),
-              player: evt.player,
-            };
-
-            if (index !== -1) {
-              // Only update if data is different (avoid infinite loops/renders if identifying objects)
-              if (newHistory[index].distance !== newEntry.distance || newHistory[index].x !== newEntry.x) {
-                newHistory[index] = newEntry;
-                changed = true;
-              }
-            } else {
-              newHistory.push(newEntry);
-              changed = true;
-            }
-          });
-          return changed ? newHistory.sort((a, b) => a.turn - b.turn) : prev;
-        });
+      if (!missingSessionNotified.current) {
+        showToast('Game not found or expired. Returning to setup.', 'info', 2500);
+        missingSessionNotified.current = true;
       }
+      resetMissingSessionState();
+      return;
+    }
 
-      if (game) {
-        const newPhase = derivePhase(game);
-        const isTransitionFromOpponentTurn =
-          (newPhase === 'my_turn' || newPhase === 'game_over') &&
-          gamePhase === 'opponent_turn';
+    missingSessionNotified.current = false;
+    mergePingEvents(events);
 
-        if (isTransitionFromOpponentTurn) {
-          // The opponent's ping that ended their turn should be at
-          // turn = game.current_turn - 1. If it hasn't been indexed yet,
-          // defer the game state update until the next poll so the ping
-          // and the turn change become visible at the same time.
-          const expectedTurn = game.current_turn - 1;
-          const opponentPingPresent = events.some(e => e.turn === expectedTurn);
+    const previousPhase = gamePhaseRef.current;
+    const newPhase = derivePhase(game);
 
-          if (!opponentPingPresent) {
-            // Skip game state + phase update this cycle.
-            // The next poll will have the event and will proceed normally.
-            return;
-          }
-        }
-
-        setGameState(game);
-        if (newPhase === 'game_over' && gamePhase !== 'game_over') {
-          setShowGameOverModal(true);
-          // Play victory or defeat sound
-          if (game.winner === userAddress) {
-            sound.playVictory();
-          } else {
-            sound.playDefeat();
-          }
-        }
-        if (newPhase === 'my_turn' && gamePhase !== 'my_turn') {
-          sound.playMyTurn();
-        }
-        setGamePhase(newPhase);
+    setGameState(game);
+    if (newPhase === 'game_over' && previousPhase !== 'game_over') {
+      setShowGameOverModal(true);
+      if (game.winner === userAddress) {
+        void soundCallbacksRef.current.playVictory();
+      } else {
+        void soundCallbacksRef.current.playDefeat();
       }
-    };
-    load();
-    const interval = setInterval(load, 5000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [sessionId, gamePhase, derivePhase, sound, userAddress]);
+    }
+    if (newPhase === 'my_turn' && previousPhase !== 'my_turn') {
+      void soundCallbacksRef.current.playMyTurn();
+    }
+    setGamePhase(newPhase);
+
+    if (reason === 'push-hint' && newPhase === 'my_turn') {
+      setRelayStatusMessage(null);
+    }
+  }, [sessionId, derivePhase, userAddress, mergePingEvents, resetMissingSessionState]);
+
+  useEffect(() => {
+    if (gamePhase === 'create') return;
+    void syncFromChain('phase-change');
+  }, [sessionId, gamePhase, syncFromChain]);
 
   // Restore secret
   useEffect(() => {
@@ -314,6 +391,22 @@ export function DeadDropGame({
     } else { setPlayerSecret(null); }
   }, [sessionId, userAddress]);
 
+  useEffect(() => {
+    relayResponderBusy.current = false;
+    missingSessionNotified.current = false;
+    webRtcPeerRef.current?.close();
+    webRtcPeerRef.current = null;
+    sessionPushRef.current?.close();
+    sessionPushRef.current = null;
+    for (const pending of pendingPushProofRequests.current.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('Session changed'));
+    }
+    pendingPushProofRequests.current.clear();
+    setIsWebRtcReady(false);
+    setRelayStatusMessage(null);
+  }, [sessionId]);
+
   // Reset game state when the active player address changes and they are not in the current game
   useEffect(() => {
     if (gamePhase === 'create') return; // already on create screen, nothing to do
@@ -322,6 +415,19 @@ export function DeadDropGame({
     }
     // New address is not a participant (or no game exists yet) — reset to create
     actionLock.current = false;
+    relayResponderBusy.current = false;
+    missingSessionNotified.current = false;
+    webRtcPeerRef.current?.close();
+    webRtcPeerRef.current = null;
+    sessionPushRef.current?.close();
+    sessionPushRef.current = null;
+    for (const pending of pendingPushProofRequests.current.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('Player switched'));
+    }
+    pendingPushProofRequests.current.clear();
+    setIsWebRtcReady(false);
+    setRelayStatusMessage(null);
     setGamePhase('create');
     setSessionId(createRandomSessionId());
     setGameState(null);
@@ -345,6 +451,361 @@ export function DeadDropGame({
       y: (playerSecret.y + opponentSecret.y) % GRID_SIZE,
     };
   }, [playerSecret, gameState, sessionId, userAddress]);
+
+  const manualDrop = (manualOppX !== '' && manualOppY !== '' && playerSecret)
+    ? { x: (playerSecret.x + Number(manualOppX)) % GRID_SIZE, y: (playerSecret.y + Number(manualOppY)) % GRID_SIZE }
+    : null;
+
+  const buildWebRtcProofResponse = useCallback(async (
+    request: WebRtcPingRequest
+  ): Promise<RelayProofArtifacts> => {
+    if (!DEAD_DROP_PROVER_URL) {
+      throw new Error('Prover URL is not configured');
+    }
+
+    const currentSecret = playerSecretRef.current;
+    if (!currentSecret) {
+      throw new Error('Missing game state or local secret for WebRTC proof');
+    }
+    if (request.sessionId !== sessionId) {
+      throw new Error('Session mismatch for incoming WebRTC ping request');
+    }
+    const onChainGame = await deadDropService.getGame(request.sessionId);
+    if (!onChainGame) {
+      throw new Error('Game not found for incoming WebRTC ping request');
+    }
+    if (onChainGame.player1 !== userAddress && onChainGame.player2 !== userAddress) {
+      throw new Error('Current player is not part of this game session');
+    }
+    if (request.turn !== onChainGame.current_turn) {
+      throw new Error('Turn mismatch for incoming WebRTC ping request');
+    }
+
+    // Responder is the current player (me). Proof uses only responder secret +
+    // pinger-provided partial offsets.
+    const isResponderP1 = onChainGame.player1 === userAddress;
+    const responderCommitmentHex = toBuffer(
+      isResponderP1 ? onChainGame.commitment1 : onChainGame.commitment2
+    ).toString('hex');
+    const responderSaltHex = Buffer.from(currentSecret.salt).toString('hex');
+
+    setRelayStatusMessage('Generating ZK proof on server (~15s)...');
+    try {
+      const result = await provePingViaBackend(DEAD_DROP_PROVER_URL, {
+        sessionId: request.sessionId,
+        turn: request.turn,
+        partialDx: request.partialDx,
+        partialDy: request.partialDy,
+        responderX: currentSecret.x,
+        responderY: currentSecret.y,
+        responderSaltHex,
+        responderCommitmentHex,
+      });
+      return {
+        distance: result.distance,
+        proofHex: result.proofHex,
+        publicInputsHex: result.publicInputsHex,
+      };
+    } finally {
+      setRelayStatusMessage(null);
+    }
+  }, [sessionId, userAddress]);
+
+  useEffect(() => {
+    const currentGame = gameState;
+    if (!DEAD_DROP_PROVER_URL || !currentGame || !playerSecret) {
+      webRtcPeerRef.current?.close();
+      webRtcPeerRef.current = null;
+      setIsWebRtcReady(false);
+      return;
+    }
+
+    if (currentGame.player1 !== userAddress && currentGame.player2 !== userAddress) {
+      return;
+    }
+
+    const opponentAddress = currentGame.player1 === userAddress
+      ? currentGame.player2
+      : currentGame.player1;
+
+    const peer = new DeadDropWebRtcPeer({
+      proverUrl: DEAD_DROP_PROVER_URL,
+      sessionId,
+      selfAddress: userAddress,
+      peerAddress: opponentAddress,
+    });
+
+    webRtcPeerRef.current?.close();
+    webRtcPeerRef.current = peer;
+    setIsWebRtcReady(false);
+
+    let cancelled = false;
+    void peer.connect(buildWebRtcProofResponse)
+      .then(() => {
+        if (!cancelled) {
+          setIsWebRtcReady(true);
+        }
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setIsWebRtcReady(false);
+        console.warn('WebRTC relay connection unavailable; using HTTP relay fallback', err);
+      });
+
+    return () => {
+      cancelled = true;
+      if (webRtcPeerRef.current === peer) {
+        webRtcPeerRef.current = null;
+      }
+      peer.close();
+      setIsWebRtcReady(false);
+    };
+  }, [
+    sessionId,
+    userAddress,
+    gameState?.player1,
+    gameState?.player2,
+    playerSecret,
+    buildWebRtcProofResponse,
+  ]);
+
+  const rejectPendingPushProofRequests = useCallback((message: string) => {
+    for (const pending of pendingPushProofRequests.current.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(message));
+    }
+    pendingPushProofRequests.current.clear();
+  }, []);
+
+  const requestProofViaSessionPush = useCallback(async (
+    opponentAddress: string,
+    request: WebRtcPingRequest,
+  ): Promise<RelayProofArtifacts> => {
+    const client = sessionPushRef.current;
+    if (!client || !client.isOpen()) {
+      throw new Error('Session push channel is not connected');
+    }
+
+    const requestId = typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `proof-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+
+    return new Promise<RelayProofArtifacts>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingPushProofRequests.current.delete(requestId);
+        reject(new Error('Timed out waiting for push proof response'));
+      }, 120_000);
+
+      pendingPushProofRequests.current.set(requestId, { resolve, reject, timer });
+      client.sendDirect(opponentAddress, 'proof.request', {
+        request_id: requestId,
+        session_id: request.sessionId,
+        turn: request.turn,
+        partial_dx: request.partialDx,
+        partial_dy: request.partialDy,
+      });
+    });
+  }, []);
+
+  const sendPushDirectBestEffort = useCallback(async (
+    to: string,
+    event: string,
+    payload: unknown,
+  ) => {
+    if (!DEAD_DROP_PROVER_URL) return;
+    const existing = sessionPushRef.current;
+    if (existing && existing.isOpen()) {
+      existing.sendDirect(to, event, payload);
+      return;
+    }
+
+    const temp = new DeadDropSessionPushClient({
+      proverUrl: DEAD_DROP_PROVER_URL,
+      sessionId,
+      selfAddress: userAddress,
+    });
+    try {
+      await temp.connect();
+      temp.sendDirect(to, event, payload);
+    } finally {
+      temp.close();
+    }
+  }, [sessionId, userAddress]);
+
+  useEffect(() => {
+    if (!DEAD_DROP_PROVER_URL || gamePhase === 'create') {
+      sessionPushRef.current?.close();
+      sessionPushRef.current = null;
+      rejectPendingPushProofRequests('Session push channel closed');
+      return;
+    }
+
+    const client = new DeadDropSessionPushClient({
+      proverUrl: DEAD_DROP_PROVER_URL,
+      sessionId,
+      selfAddress: userAddress,
+      onReady: (peers) => {
+        if (peers.length > 0) {
+          void syncFromChain('push-hint');
+        }
+      },
+      onPeerJoined: () => {
+        void syncFromChain('push-hint');
+      },
+      onDirect: (message) => {
+        if (message.event === 'proof.request') {
+          if (relayResponderBusy.current) return;
+          const payload = message.payload as any;
+          const requestId = String(payload?.request_id || '');
+          const incomingRequest: WebRtcPingRequest = {
+            sessionId: Number(payload?.session_id),
+            turn: Number(payload?.turn),
+            partialDx: Number(payload?.partial_dx),
+            partialDy: Number(payload?.partial_dy),
+          };
+          if (
+            !requestId
+            || !Number.isInteger(incomingRequest.sessionId)
+            || !Number.isInteger(incomingRequest.turn)
+            || !Number.isInteger(incomingRequest.partialDx)
+            || !Number.isInteger(incomingRequest.partialDy)
+            || incomingRequest.partialDx < 0
+            || incomingRequest.partialDx >= GRID_SIZE
+            || incomingRequest.partialDy < 0
+            || incomingRequest.partialDy >= GRID_SIZE
+          ) {
+            return;
+          }
+
+          relayResponderBusy.current = true;
+          void buildWebRtcProofResponse(incomingRequest)
+            .then((proof) => {
+              if (!client.isOpen()) return;
+              client.sendDirect(message.from, 'proof.response', {
+                request_id: requestId,
+                proof,
+              });
+            })
+            .catch((err: unknown) => {
+              if (!client.isOpen()) return;
+              client.sendDirect(message.from, 'proof.error', {
+                request_id: requestId,
+                error: toErrorMessage(err, 'Failed to generate proof'),
+              });
+            })
+            .finally(() => {
+              relayResponderBusy.current = false;
+            });
+          return;
+        }
+
+        if (message.event === 'proof.response') {
+          const payload = message.payload as any;
+          const requestId = String(payload?.request_id || '');
+          if (!requestId) return;
+          const pending = pendingPushProofRequests.current.get(requestId);
+          if (!pending) return;
+          pendingPushProofRequests.current.delete(requestId);
+          clearTimeout(pending.timer);
+          const proof = payload?.proof as RelayProofArtifacts | undefined;
+          if (!proof || !Number.isInteger(proof.distance)) {
+            pending.reject(new Error('Invalid proof response payload'));
+            return;
+          }
+          pending.resolve(proof);
+          return;
+        }
+
+        if (message.event === 'proof.error') {
+          const payload = message.payload as any;
+          const requestId = String(payload?.request_id || '');
+          if (!requestId) return;
+          const pending = pendingPushProofRequests.current.get(requestId);
+          if (!pending) return;
+          pendingPushProofRequests.current.delete(requestId);
+          clearTimeout(pending.timer);
+          pending.reject(new Error(String(payload?.error || 'Peer failed to produce proof')));
+          return;
+        }
+
+        if (message.event === 'lobby.joined' || message.event === 'game.hint') {
+          const payload = message.payload as any;
+          if (payload?.ping) {
+            const ping = payload.ping;
+            if (
+              Number.isInteger(ping.turn)
+              && Number.isInteger(ping.x)
+              && Number.isInteger(ping.y)
+              && Number.isInteger(ping.distance)
+              && typeof ping.player === 'string'
+            ) {
+              mergePingEvents([{
+                player: ping.player,
+                turn: ping.turn,
+                distance: ping.distance,
+                x: ping.x,
+                y: ping.y,
+              }]);
+            }
+          }
+          void syncFromChain('push-hint');
+        }
+      },
+      onBroadcast: (message) => {
+        if (message.event === 'lobby.joined' || message.event === 'game.hint') {
+          const payload = message.payload as any;
+          if (payload?.ping) {
+            const ping = payload.ping;
+            if (
+              Number.isInteger(ping.turn)
+              && Number.isInteger(ping.x)
+              && Number.isInteger(ping.y)
+              && Number.isInteger(ping.distance)
+              && typeof ping.player === 'string'
+            ) {
+              mergePingEvents([{
+                player: ping.player,
+                turn: ping.turn,
+                distance: ping.distance,
+                x: ping.x,
+                y: ping.y,
+              }]);
+            }
+          }
+          void syncFromChain('push-hint');
+        }
+      },
+      onError: (error) => {
+        console.warn('Session push channel warning:', error);
+      },
+    });
+
+    sessionPushRef.current?.close();
+    sessionPushRef.current = client;
+
+    let cancelled = false;
+    void client.connect().catch((err: unknown) => {
+      if (cancelled) return;
+      console.warn('Failed to connect session push channel:', err);
+    });
+
+    return () => {
+      cancelled = true;
+      if (sessionPushRef.current === client) {
+        sessionPushRef.current = null;
+      }
+      client.close();
+      rejectPendingPushProofRequests('Session push channel closed');
+    };
+  }, [
+    gamePhase,
+    sessionId,
+    userAddress,
+    buildWebRtcProofResponse,
+    mergePingEvents,
+    syncFromChain,
+    rejectPendingPushProofRequests,
+  ]);
 
   // Actions
   const handleImportAndStart = async () => {
@@ -405,10 +866,9 @@ export function DeadDropGame({
         sound.playLobbyOpened();
         sound.startAmbient();
         onStandingsRefresh();
-        onStandingsRefresh();
         // showToast('Lobby opened! Share the room code: ' + sessionId, 'success'); // Redundant with UI
-      } catch (err: any) {
-        showToast(err.message || 'Failed to open lobby', 'error');
+      } catch (err: unknown) {
+        showToast(toErrorMessage(err, 'Failed to open lobby'), 'error');
       } finally { setLoading(false); }
     });
   };
@@ -436,9 +896,11 @@ export function DeadDropGame({
         const game = await deadDropService.getGame(roomCode);
         setGameState(game);
         setGamePhase('commit');
+        void sendPushDirectBestEffort(lobby.host, 'lobby.joined', {
+          session_id: roomCode,
+        });
         sound.playOpponentJoined();
         sound.startAmbient();
-        onStandingsRefresh();
         onStandingsRefresh();
         // showToast('Joined game!', 'success'); // Redundant
       } catch (err: any) {
@@ -463,6 +925,13 @@ export function DeadDropGame({
         sound.playCommitSecret();
         const game = await deadDropService.getGame(sessionId);
         setGameState(game); setGamePhase(derivePhase(game));
+        if (game) {
+          const opponentAddress = game.player1 === userAddress ? game.player2 : game.player1;
+          void sendPushDirectBestEffort(opponentAddress, 'game.hint', {
+            type: 'commit',
+            session_id: sessionId,
+          });
+        }
       } catch (err: any) {
         showToast(err.message || 'Failed to commit', 'error');
       } finally { setLoading(false); }
@@ -470,48 +939,152 @@ export function DeadDropGame({
   };
 
   const handleSubmitPing = async () => {
-    if (!selectedCell || !gameState) return;
+    if (!selectedCell || !gameState || !playerSecret) return;
     await runAction(async () => {
       try {
         setLoading(true);
-        const isP1 = gameState.player1 === userAddress;
-        const opponentAddr = isP1 ? gameState.player2 : gameState.player1;
-        const responderCommitment = isP1
-          ? Buffer.from(gameState.commitment2 as any)
-          : Buffer.from(gameState.commitment1 as any);
-
-        const opponentSecret = getOpponentSecret(sessionId, opponentAddr);
-        let mockDistance: number;
-        if (playerSecret && opponentSecret) {
-          const dropX = (playerSecret.x + opponentSecret.x) % GRID_SIZE;
-          const dropY = (playerSecret.y + opponentSecret.y) % GRID_SIZE;
-          mockDistance = wrappedManhattan(selectedCell.x, selectedCell.y, dropX, dropY);
-        } else {
-          mockDistance = Math.floor(Math.random() * 50) + 1;
+        const onChainGame = await deadDropService.getGame(sessionId);
+        if (!onChainGame) {
+          throw new Error('Game not found or expired. Reload and try again.');
         }
-        const journalHash = await computeJournalHash(sessionId, gameState.current_turn, mockDistance, responderCommitment);
+        if (onChainGame.player1 !== userAddress && onChainGame.player2 !== userAddress) {
+          throw new Error('You are not a player in this game.');
+        }
+
+        const submittedTurn = onChainGame.current_turn;
+        const isP1 = onChainGame.player1 === userAddress;
+        const opponentAddr = isP1 ? onChainGame.player2 : onChainGame.player1;
+        const opponentSecret = getOpponentSecret(sessionId, opponentAddr);
+
+        // Nuclear-keys partial offsets:
+        // partial = (ping - pinger_secret) mod GRID_SIZE
+        const partialDx = (selectedCell.x + GRID_SIZE - playerSecret.x) % GRID_SIZE;
+        const partialDy = (selectedCell.y + GRID_SIZE - playerSecret.y) % GRID_SIZE;
+        const pingRequest = {
+          sessionId,
+          turn: submittedTurn,
+          partialDx,
+          partialDy,
+        };
+
+        // Responder commitment for this turn:
+        // - P1 turn => responder is P2
+        // - P2 turn => responder is P1
+        const responderCommitmentHex = toBuffer(
+          isP1 ? onChainGame.commitment2 : onChainGame.commitment1
+        ).toString('hex');
+
+        let distance: number;
+        let proofBuf: Buffer;
+        let publicInputsBufs: Buffer[];
+
+        if (DEAD_DROP_PROVER_URL) {
+          setRelayStatusMessage(isWebRtcReady
+            ? 'Requesting proof over direct channel...'
+            : 'Requesting proof over push channel...');
+          try {
+            let proof: RelayProofArtifacts | null = null;
+
+            const webRtcPeer = webRtcPeerRef.current;
+            if (webRtcPeer?.isReady()) {
+              try {
+                proof = await webRtcPeer.requestProof(pingRequest);
+              } catch (webRtcErr: unknown) {
+                console.warn('WebRTC proof request failed, falling back to push channel', webRtcErr);
+              }
+            }
+
+            if (!proof) {
+              proof = await requestProofViaSessionPush(opponentAddr, pingRequest);
+            }
+
+            distance = proof.distance;
+            proofBuf = Buffer.from(proof.proofHex, 'hex');
+            publicInputsBufs = proof.publicInputsHex.map(h => Buffer.from(h, 'hex'));
+          } catch (relayError) {
+            if (isProverSchemaMismatchError(relayError)) {
+              throw relayError;
+            }
+            if (!opponentSecret) {
+              throw relayError;
+            }
+
+            // Local fallback: generate proof client-side (single-browser testing).
+            const result = await provePingNoir({
+              sessionId,
+              turn: submittedTurn,
+              partialDx,
+              partialDy,
+              responderX: opponentSecret.x,
+              responderY: opponentSecret.y,
+              responderSalt: opponentSecret.salt,
+              responderCommitment: responderCommitmentHex,
+            });
+
+            distance = result.distance;
+            proofBuf = Buffer.from(result.proofHex, 'hex');
+            publicInputsBufs = result.publicInputsHex.map(h => Buffer.from(h, 'hex'));
+          } finally {
+            setRelayStatusMessage(null);
+          }
+        } else {
+          // Local deterministic fallback: generate proof entirely client-side.
+          if (!opponentSecret) {
+            throw new Error(
+              'Missing local secret data for deterministic fallback. ' +
+              'Reload the session or configure VITE_DEAD_DROP_PROVER_URL.'
+            );
+          }
+
+          const result = await provePingNoir({
+            sessionId,
+            turn: submittedTurn,
+            partialDx,
+            partialDy,
+            responderX: opponentSecret.x,
+            responderY: opponentSecret.y,
+            responderSalt: opponentSecret.salt,
+            responderCommitment: responderCommitmentHex,
+          });
+
+          distance = result.distance;
+          proofBuf = Buffer.from(result.proofHex, 'hex');
+          publicInputsBufs = result.publicInputsHex.map(h => Buffer.from(h, 'hex'));
+        }
+
         const signer = getContractSigner();
         await deadDropService.submitPing(
-          sessionId, userAddress, gameState.current_turn, mockDistance,
-          selectedCell.x, selectedCell.y,
-          journalHash, MOCK_IMAGE_ID, Buffer.from([1, 2, 3]), signer
+          sessionId, userAddress, submittedTurn, distance,
+          partialDx, partialDy,
+          proofBuf, publicInputsBufs, signer
         );
 
-        const zone = getTemperatureZone(mockDistance);
+        const zone = getTemperatureZone(distance);
         sound.playPingResult(zone);
         setPingHistory(prev => {
           // We optimistic update, but filter out duplicates if event comes in later
-          if (prev.some(p => p.turn === gameState.current_turn)) return prev;
+          if (prev.some(p => p.turn === submittedTurn)) return prev;
           return [...prev, {
-            turn: gameState.current_turn, x: selectedCell.x, y: selectedCell.y, distance: mockDistance, zone, player: userAddress
+            turn: submittedTurn, x: selectedCell.x, y: selectedCell.y, distance, zone, player: userAddress, coordVisibility: 'exact' as const
           }].sort((a, b) => a.turn - b.turn)
         });
         setSelectedCell(null);
-        showToast(mockDistance === 0 ? 'DROP FOUND!' : `${zone} (${mockDistance}m)`, 'info', 3000);
+        showToast(distance === 0 ? 'DROP FOUND!' : `${zone} (${distance}m)`, 'info', 3000);
         const updatedGame = await deadDropService.getGame(sessionId);
         setGameState(updatedGame);
         const newPhase = derivePhase(updatedGame);
         setGamePhase(newPhase);
+        void sendPushDirectBestEffort(opponentAddr, 'game.hint', {
+          type: 'ping',
+          session_id: sessionId,
+          ping: {
+            turn: submittedTurn,
+            x: partialDx,
+            y: partialDy,
+            distance,
+            player: userAddress,
+          },
+        });
         if (newPhase === 'game_over') {
           setShowGameOverModal(true);
         }
@@ -531,6 +1104,16 @@ export function DeadDropGame({
         sound.playTimeout();
         const game = await deadDropService.getGame(sessionId);
         setGameState(game); setGamePhase('game_over'); setShowGameOverModal(true); onStandingsRefresh();
+        const currentGame = gameStateRef.current;
+        if (currentGame) {
+          const opponentAddress = currentGame.player1 === userAddress
+            ? currentGame.player2
+            : currentGame.player1;
+          void sendPushDirectBestEffort(opponentAddress, 'game.hint', {
+            type: 'timeout',
+            session_id: sessionId,
+          });
+        }
       } catch (err: any) {
         showToast(err.message || 'Timeout not reached yet', 'error');
       } finally { setLoading(false); }
@@ -541,6 +1124,15 @@ export function DeadDropGame({
     if (gameState?.winner) onGameComplete();
     sound.stopAmbient();
     actionLock.current = false;
+    relayResponderBusy.current = false;
+    missingSessionNotified.current = false;
+    webRtcPeerRef.current?.close();
+    webRtcPeerRef.current = null;
+    sessionPushRef.current?.close();
+    sessionPushRef.current = null;
+    rejectPendingPushProofRequests('Game reset');
+    setIsWebRtcReady(false);
+    setRelayStatusMessage(null);
     setGamePhase('create'); setSessionId(createRandomSessionId());
     setGameState(null); setPlayerSecret(null); setPingHistory([]);
     setSelectedCell(null); setLoading(false);
@@ -834,7 +1426,7 @@ export function DeadDropGame({
                   onCellSelect={setSelectedCell}
                   interactive={gamePhase === 'my_turn'}
                   showDrop={showDebug}
-                  dropCoords={getDropCoords()}
+                  dropCoords={getDropCoords() ?? (showDebug ? manualDrop : null)}
                   userAddress={userAddress}
                 />
               </div>
@@ -850,7 +1442,9 @@ export function DeadDropGame({
                   >
                     <div className="bg-black/80 border border-slate-700/50 px-6 py-4 rounded-xl flex flex-col items-center gap-3 backdrop-blur-md shadow-2xl">
                       <Loader2 className="w-8 h-8 text-slate-400 animate-spin" />
-                      <p className="text-xs font-bold text-slate-300 uppercase tracking-widest">Opponent's turn</p>
+                      <p className="text-xs font-bold text-slate-300 uppercase tracking-widest">
+                        {relayStatusMessage || "Opponent's turn"}
+                      </p>
                     </div>
                   </motion.div>
                 )}
@@ -905,7 +1499,7 @@ export function DeadDropGame({
                 onCellSelect={() => { }}
                 interactive={false}
                 showDrop={true}
-                dropCoords={getDropCoords()}
+                dropCoords={getDropCoords() ?? manualDrop}
                 userAddress={userAddress}
               />
             </div>
@@ -924,8 +1518,14 @@ export function DeadDropGame({
             </div>
           ) : (
             <div className="space-y-2">
+              <div className="px-2">
+                <p className="text-[10px] text-amber-300/80 uppercase tracking-wide">
+                  Opponent coordinates stay unknown by design. Only temperature and distance are revealed.
+                </p>
+              </div>
               {[...pingHistory].reverse().map((ping, i) => {
                 const isMe = ping.player === userAddress;
+                const hasExactCoords = ping.coordVisibility === 'exact';
                 return (
                   <div key={i} className={`flex items-center justify-between p-3 border rounded-lg transition-colors ${isMe ? 'bg-emerald-500/5 border-emerald-500/15 hover:bg-emerald-500/10' : 'bg-amber-500/5 border-amber-500/15 hover:bg-amber-500/10'}`}>
                     <div className="flex flex-col gap-0.5">
@@ -936,7 +1536,9 @@ export function DeadDropGame({
                         </span>
                       </div>
                       <span className="font-mono text-xs text-slate-300">
-                        {formatLatLng(gridToLatLng(ping.x, ping.y).lat, gridToLatLng(ping.x, ping.y).lng)}
+                        {hasExactCoords
+                          ? formatLatLng(gridToLatLng(ping.x, ping.y).lat, gridToLatLng(ping.x, ping.y).lng)
+                          : 'UNKNOWN (CLASSIFIED)'}
                       </span>
                     </div>
                     <div className="text-right">
@@ -983,8 +1585,50 @@ export function DeadDropGame({
               {showDebug ? 'Disable' : 'Enable'} Debug Mode
             </button>
             {showDebug && (
-              <div className="mt-2 p-2 bg-red-900/20 rounded text-xs text-red-400">
-                <p>Secret: {playerSecret ? `${playerSecret.x},${playerSecret.y}` : 'N/A'}</p>
+              <div className="mt-2 p-2 bg-red-900/20 rounded text-xs text-red-400 space-y-2">
+                {/* Own coords — copyable */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <span style={{ color: 'var(--color-ink-muted)', fontSize: '0.75rem' }}>Your drop:</span>
+                  <code style={{ color: '#f59e0b', fontSize: '0.75rem' }}>
+                    {playerSecret ? `${playerSecret.x},${playerSecret.y}` : 'N/A'}
+                  </code>
+                  {playerSecret && (
+                    <button
+                      onClick={() => {
+                        navigator.clipboard.writeText(`${playerSecret.x},${playerSecret.y}`);
+                        setCopiedCoords(true);
+                        setTimeout(() => setCopiedCoords(false), 2000);
+                      }}
+                      className="p-0.5 hover:text-amber-400 transition-colors"
+                      title="Copy coordinates"
+                    >
+                      {copiedCoords ? <Check size={12} /> : <Copy size={12} />}
+                    </button>
+                  )}
+                </div>
+
+                {/* Manual opponent-coord input */}
+                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                  <span style={{ color: 'var(--color-ink-muted)', fontSize: '0.75rem' }}>Opp:</span>
+                  <input
+                    type="number" min={0} max={99} value={manualOppX}
+                    onChange={e => setManualOppX(e.target.value)}
+                    placeholder="X"
+                    style={{ width: '3rem', background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)', borderRadius: '4px', padding: '2px 4px', color: '#fff', fontSize: '0.75rem' }}
+                  />
+                  <input
+                    type="number" min={0} max={99} value={manualOppY}
+                    onChange={e => setManualOppY(e.target.value)}
+                    placeholder="Y"
+                    style={{ width: '3rem', background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)', borderRadius: '4px', padding: '2px 4px', color: '#fff', fontSize: '0.75rem' }}
+                  />
+                  {manualOppX !== '' && manualOppY !== '' && playerSecret && (
+                    <span style={{ color: '#f59e0b', fontSize: '0.75rem' }}>
+                      → {(playerSecret.x + Number(manualOppX)) % GRID_SIZE},{(playerSecret.y + Number(manualOppY)) % GRID_SIZE}
+                    </span>
+                  )}
+                </div>
+
                 <button
                   onClick={handleForceTimeout}
                   disabled={loading}

@@ -10,9 +10,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@aztec/bb.js": "^2.1.11",
     "@creit-tech/stellar-wallets-kit": "npm:@jsr/creit-tech__stellar-wallets-kit@2.0.0-beta.5",
+    "@noir-lang/noir_js": "^1.0.0-beta.18",
     "@stellar/freighter-api": "^6.0.1",
     "@stellar/stellar-sdk": "^14.4.2",
+    "@zkpassport/poseidon2": "^0.6.2",
     "buffer": "^6.0.3",
     "clsx": "^2.1.1",
     "framer-motion": "^12.33.0",
@@ -22,6 +25,7 @@
     "react-dom": "^19.2.1",
     "react-leaflet": "^5.0.0",
     "sac-sdk": "^0.4.2",
+    "smart-account-kit": "^0.2.3",
     "tailwind-merge": "^3.4.0",
     "tone": "^15.1.22",
     "zustand": "^5.0.9"
