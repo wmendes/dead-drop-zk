@@ -1,28 +1,24 @@
 /* ================================================
-   LAYOUT STYLES — Cold War Spy Terminal Theme
+   LAYOUT STYLES — Mobile-first No-Scroll Shell
    ================================================ */
 
 .studio {
   position: relative;
   height: 100dvh;
-  /* Full viewport height */
   display: flex;
   flex-direction: column;
   color: var(--spy-terminal-green);
   background: #020617;
   overflow: hidden;
-  /* Prevent body scrolling */
   font-family: var(--font-mono);
 }
 
-/* When inside the phone frame, use 100% height to fill the frame */
 .phone-screen .studio {
   height: 100%;
 }
 
-/* Background — subtle grid pattern like radar */
 .studio-background {
-  position: fixed;
+  position: absolute;
   inset: 0;
   z-index: 0;
   pointer-events: none;
@@ -30,244 +26,331 @@
 
 .studio-orb {
   position: absolute;
-  width: 48vw;
-  height: 48vw;
+  width: min(50vw, 280px);
+  height: min(50vw, 280px);
   border-radius: 50%;
-  filter: blur(100px);
-  opacity: 0.08;
-  animation: float 30s ease-in-out infinite;
+  filter: blur(92px);
+  opacity: 0.1;
+  animation: float 24s ease-in-out infinite;
 }
 
 .orb-1 {
-  top: -15%;
+  top: -14%;
   left: -10%;
-  background: radial-gradient(circle at 35% 35%, rgba(74, 222, 128, 0.6), transparent 65%);
+  background: radial-gradient(circle at 35% 35%, rgba(74, 222, 128, 0.75), transparent 66%);
   animation-delay: 0s;
 }
 
 .orb-2 {
-  right: -10%;
-  top: -5%;
-  background: radial-gradient(circle at 65% 35%, rgba(34, 211, 238, 0.4), transparent 68%);
-  animation-delay: -10s;
+  right: -12%;
+  top: -8%;
+  background: radial-gradient(circle at 65% 35%, rgba(34, 211, 238, 0.6), transparent 68%);
+  animation-delay: -8s;
 }
 
 .orb-3 {
-  bottom: -25%;
-  left: 25%;
-  background: radial-gradient(circle at 50% 50%, rgba(251, 191, 36, 0.3), transparent 70%);
-  animation-delay: -20s;
+  bottom: -24%;
+  left: 30%;
+  background: radial-gradient(circle at 50% 50%, rgba(251, 191, 36, 0.45), transparent 70%);
+  animation-delay: -16s;
 }
 
 .studio-grid {
   position: absolute;
   inset: 0;
   background-image:
-    linear-gradient(90deg, rgba(74, 222, 128, 0.03) 1px, transparent 1px),
-    linear-gradient(rgba(74, 222, 128, 0.03) 1px, transparent 1px);
-  background-size: 60px 60px;
+    linear-gradient(90deg, rgba(74, 222, 128, 0.04) 1px, transparent 1px),
+    linear-gradient(rgba(74, 222, 128, 0.04) 1px, transparent 1px);
+  background-size: 54px 54px;
   opacity: 0.6;
 }
 
 .studio-header,
 .studio-main,
-.studio-footer {
+.studio-footer,
+.studio-footer-menu {
   position: relative;
   z-index: 1;
 }
 
-/* Header — Terminal Bar */
 .studio-header {
-  display: none;
+  min-height: calc(56px + env(safe-area-inset-top));
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: calc(env(safe-area-inset-top) + 0.35rem) 0.65rem 0.4rem;
+  border-bottom: 1px solid rgba(74, 222, 128, 0.15);
+  background: linear-gradient(180deg, rgba(2, 6, 23, 0.95), rgba(2, 6, 23, 0.72));
+  backdrop-filter: blur(8px);
 }
 
-/* Brand — Spy Mission Header */
+.brand-shell {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.brand-mark {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+}
+
+.brand-mark svg {
+  filter: drop-shadow(0 0 10px rgba(74, 222, 128, 0.25));
+}
+
 .brand {
-  animation: fadeUp 0.6s ease both;
+  min-width: 0;
 }
 
 .brand-title {
-  font-family: var(--font-mono);
-  font-size: 1.1rem;
-  font-weight: 700;
-  line-height: 1.2;
+  line-height: 1;
   margin: 0;
-  color: var(--spy-terminal-green);
-  letter-spacing: 0.1em;
+  font-family: var(--font-mono);
+  font-size: 0.93rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
-  text-shadow: 0 0 10px rgba(74, 222, 128, 0.4);
+  color: #86efac;
+  white-space: nowrap;
+  text-shadow: 0 0 10px rgba(74, 222, 128, 0.35);
 }
 
 .brand-subtitle {
-  color: rgba(74, 222, 128, 0.5);
-  font-size: 0.6rem;
   margin: 0.15rem 0 0;
-  font-family: var(--font-mono);
+  font-size: 0.5rem;
   letter-spacing: 0.15em;
   text-transform: uppercase;
+  color: rgba(148, 163, 184, 0.72);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 150px;
 }
 
-/* Header Actions */
-.header-actions {
-  display: flex;
+.wallet-chip {
+  min-width: 0;
+  max-width: 52%;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: rgba(15, 23, 42, 0.7);
+  color: #e2e8f0;
+  display: inline-flex;
   align-items: center;
-  gap: 0.4rem;
-  flex-wrap: wrap;
-}
-
-/* Network Pills — Terminal Tags */
-.network-pill {
-  padding: 0.25rem 0.6rem;
-  border-radius: 2px;
-  border: 1px solid rgba(74, 222, 128, 0.25);
-  font-size: 0.55rem;
-  letter-spacing: 0.15em;
+  gap: 0.35rem;
+  min-height: 2rem;
+  padding: 0.32rem 0.5rem;
+  font-size: 0.64rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
-  background: rgba(0, 20, 10, 0.8);
-  font-family: var(--font-mono);
-  font-weight: 600;
-  color: rgba(74, 222, 128, 0.6);
+  transition: 140ms ease;
+  flex-shrink: 0;
 }
 
-.network-pill.dev-pill {
-  border-color: rgba(251, 191, 36, 0.4);
-  background: rgba(251, 191, 36, 0.1);
-  color: var(--spy-terminal-amber);
+.wallet-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+  flex-shrink: 0;
 }
 
-/* Main Content */
+.wallet-actions.connected .wallet-chip {
+  max-width: 42vw;
+}
+
+.wallet-chip.connected {
+  border-color: rgba(74, 222, 128, 0.45);
+  background: rgba(16, 185, 129, 0.13);
+  color: #bbf7d0;
+}
+
+.wallet-chip.disconnected {
+  border-color: rgba(148, 163, 184, 0.25);
+  background: rgba(30, 41, 59, 0.45);
+  color: rgba(148, 163, 184, 0.95);
+}
+
+.wallet-chip:disabled {
+  cursor: default;
+}
+
+.wallet-chip:not(:disabled):hover {
+  transform: translateY(-1px);
+  background: rgba(16, 185, 129, 0.18);
+}
+
+.wallet-chip-status,
+.wallet-chip-copy {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.wallet-chip-text {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+
+.wallet-chip-type {
+  font-size: 0.5rem;
+  color: rgba(148, 163, 184, 0.9);
+  letter-spacing: 0.11em;
+}
+
+.wallet-disconnect {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 999px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  background: rgba(127, 29, 29, 0.3);
+  color: #fca5a5;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: 140ms ease;
+  flex-shrink: 0;
+}
+
+.wallet-disconnect:disabled {
+  opacity: 0.65;
+}
+
+.wallet-disconnect:not(:disabled):hover {
+  background: rgba(127, 29, 29, 0.45);
+  border-color: rgba(248, 113, 113, 0.5);
+  color: #fecaca;
+}
+
 .studio-main {
+  width: 100%;
   max-width: 1200px;
   margin: 0 auto;
-  width: 100%;
-  padding: 0 1rem 2rem;
   flex: 1;
-  overflow-y: auto;
-  /* Enable internal scrolling */
-  -webkit-overflow-scrolling: touch;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0.55rem 0.55rem max(0.45rem, env(safe-area-inset-bottom));
+  display: flex;
 }
 
-/* Footer — System Info Line */
+.studio-main>* {
+  flex: 1;
+  min-height: 0;
+}
+
 .studio-footer {
-  /* Hide original footer or repurposed? Let's hide it for now to avoid clutter, or maybe keep it but different style? 
-     The request implies replacing header with footer menu. 
-     Let's keep the original footer as "System Info" but maybe push it up or hide it. 
-     Actually, let's leave it as is, but ensure padding-bottom on main is enough.
-  */
-  max-width: 1200px;
-  margin: 0 auto 0.5rem;
-  width: 100%;
-  padding: 0 1.25rem;
-  display: flex;
-  justify-content: center;
-  text-align: center;
-  gap: 1rem;
-  color: rgba(74, 222, 128, 0.3);
-  font-size: 0.5rem;
-  letter-spacing: 0.1em;
-  font-family: var(--font-mono);
-  text-transform: uppercase;
-  padding-bottom: 80px;
-  /* Space for fixed footer menu */
+  display: none;
 }
 
-/* Fixed Bottom Menu */
 .studio-footer-menu {
-  /* Remove fixed positioning to be part of flex layout */
-  position: relative;
+  height: calc(58px + env(safe-area-inset-bottom));
   width: 100%;
-  height: 64px;
   display: flex;
-  z-index: 100;
-  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.5);
-  background: #020617;
-  border-top: 1px solid rgba(74, 222, 128, 0.2);
   flex-shrink: 0;
-  /* Don't shrink */
+  padding-bottom: env(safe-area-inset-bottom);
+  background: #020617;
+  border-top: 1px solid rgba(74, 222, 128, 0.15);
 }
 
 .player-switch-button {
   flex: 1;
+  min-height: 58px;
   border: none;
   font-family: var(--font-mono);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.1em;
-  font-size: 1rem;
+  font-size: 0.86rem;
   cursor: pointer;
   transition: all 0.2s;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 0.5rem;
 }
 
 .player-switch-button:active {
-  transform: translateY(2px);
+  transform: translateY(1px);
 }
 
 .player-switch-button.p1 {
   background: #fbbf24;
-  /* amber-400 */
-  color: #451a03;
-}
-
-.player-switch-button.p1:hover {
-  background: #fcd34d;
+  color: #422006;
 }
 
 .player-switch-button.p2 {
   background: #ef4444;
-  /* red-500 */
-  color: #fff;
-}
-
-.player-switch-button.p2:hover {
-  background: #f87171;
+  color: #ffffff;
 }
 
 .player-switch-button.active {
-  box-shadow: inset 0 0 0 4px rgba(0, 0, 0, 0.4);
-  filter: brightness(0.9);
+  box-shadow: inset 0 0 0 3px rgba(0, 0, 0, 0.38);
+  filter: brightness(0.92);
 }
 
 @keyframes float {
-
   0%,
   100% {
     transform: translateY(0) scale(1);
   }
 
   50% {
-    transform: translateY(10px) scale(1.02);
+    transform: translateY(9px) scale(1.02);
   }
 }
 
-@keyframes fadeUp {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@media (max-width: 767px) {
+@media (min-width: 768px) {
   .studio-header {
-    flex-direction: column;
-    align-items: flex-start;
-    padding: 0.75rem 1rem 0.5rem;
-    gap: 0.5rem;
+    min-height: calc(60px + env(safe-area-inset-top));
+    padding-left: 0.85rem;
+    padding-right: 0.85rem;
   }
 
   .studio-main {
-    padding: 0 0.5rem 1.5rem;
+    padding: 0.65rem 0.65rem 0.5rem;
+  }
+}
+
+@media (max-width: 420px) {
+  .brand-subtitle {
+    display: none;
   }
 
-  .studio-footer {
-    padding: 0 1rem;
+  .wallet-chip {
+    max-width: 48%;
+  }
+
+  .wallet-actions.connected .wallet-chip {
+    max-width: 38vw;
+  }
+
+  .wallet-chip-type {
+    display: none;
+  }
+}
+
+@media (max-width: 360px) {
+  .brand-title {
+    font-size: 0.86rem;
+    letter-spacing: 0.1em;
+  }
+
+  .wallet-chip {
+    max-width: 50%;
+    padding-inline: 0.42rem;
+  }
+
+  .wallet-actions.connected .wallet-chip {
+    max-width: 35vw;
   }
 }

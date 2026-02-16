@@ -186,6 +186,11 @@ const deadDropVerifierContractId = getEnvValue(
   'DEAD_DROP_VERIFIER_CONTRACT_ID',
   getEnvValue(existingEnv, 'VITE_DEAD_DROP_VERIFIER_CONTRACT_ID')
 );
+const deadDropRandomnessVerifierContractId = getEnvValue(
+  existingEnv,
+  'DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID',
+  getEnvValue(existingEnv, 'VITE_DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID')
+);
 const deadDropVerifierSelectorHex = getEnvValue(
   existingEnv,
   'DEAD_DROP_VERIFIER_SELECTOR_HEX',
@@ -227,6 +232,7 @@ const smartAccountRpName = getEnvValue(
 console.log(`Dead Drop verifier mode: ${deadDropVerifierMode}`);
 if (deadDropVerifierMode === "real") {
   console.log(`Dead Drop external verifier: ${deadDropVerifierContractId || "(missing)"}`);
+  console.log(`Dead Drop external randomness verifier: ${deadDropRandomnessVerifierContractId || "(default: verifier)"}`);
 }
 
 if (deadDropVerifierMode === "real" && !deadDropVerifierContractId) {
@@ -394,8 +400,9 @@ for (const contract of contracts) {
         console.error("❌ dead-drop verifier contract ID is required. Set DEAD_DROP_VERIFIER_CONTRACT_ID for real mode or deploy mock-verifier for mock mode.");
         process.exit(1);
       }
+      const randomnessVerifierId = deadDropRandomnessVerifierContractId || verifierId;
       deployResult =
-        (await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId} --verifier-id ${verifierId}`.text());
+        (await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId} --verifier-id ${verifierId} --randomness-verifier-id ${randomnessVerifierId}`.text());
     } else {
       deployResult =
         (await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId}`.text());
@@ -447,6 +454,11 @@ const deploymentInfo = {
     verifierContractId: deadDropVerifierMode === "real"
       ? deadDropVerifierContractId
       : (mockVerifierId || existingContractIds["mock-verifier"] || ""),
+    randomnessVerifierContractId: deadDropRandomnessVerifierContractId || (
+      deadDropVerifierMode === "real"
+        ? deadDropVerifierContractId
+        : (mockVerifierId || existingContractIds["mock-verifier"] || "")
+    ),
     verifierSelectorHex: deadDropVerifierSelectorHex,
     proverUrl: deadDropProverUrl,
     relayerUrl: deadDropRelayerUrl,
@@ -477,6 +489,7 @@ ${contractEnvLines}
 VITE_DEAD_DROP_PROVER_URL=${deadDropProverUrl}
 VITE_DEAD_DROP_RELAYER_URL=${deadDropRelayerUrl}
 VITE_DEAD_DROP_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.verifierContractId}
+VITE_DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.randomnessVerifierContractId}
 VITE_DEAD_DROP_VERIFIER_SELECTOR_HEX=${deadDropVerifierSelectorHex}
 VITE_WALLET_MODE=${walletMode}
 VITE_SMART_ACCOUNT_WASM_HASH=${smartAccountWasmHash}
@@ -495,6 +508,7 @@ VITE_DEV_PLAYER2_SECRET=${walletSecrets.player2}
 # Dead Drop verifier/prover mode
 DEAD_DROP_VERIFIER_MODE=${deadDropVerifierMode}
 DEAD_DROP_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.verifierContractId}
+DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.randomnessVerifierContractId}
 DEAD_DROP_VERIFIER_SELECTOR_HEX=${deadDropVerifierSelectorHex}
 OZ_RELAYER_API_KEY=${ozRelayerApiKey}
 OZ_RELAYER_BASE_URL=${ozRelayerBaseUrl}

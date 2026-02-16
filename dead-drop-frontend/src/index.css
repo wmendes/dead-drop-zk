@@ -8,9 +8,18 @@
 
 /* Base Styles */
 @layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    overflow: hidden;
+  }
+
   body {
     @apply bg-slate-950 text-slate-100 font-mono overflow-x-hidden;
     background-color: #020617;
+    margin: 0;
+    overflow: hidden;
     font-feature-settings: "rlig" 1, "calt" 1;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
@@ -301,15 +310,8 @@
     position: absolute;
     inset: 0;
     border-radius: 44px;
-    overflow-y: auto;
-    overflow-x: hidden;
+    overflow: hidden;
     background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%);
-    scrollbar-width: none;
-    -ms-overflow-style: none;
-  }
-
-  .phone-screen::-webkit-scrollbar {
-    display: none;
   }
 
   .phone-home-indicator {

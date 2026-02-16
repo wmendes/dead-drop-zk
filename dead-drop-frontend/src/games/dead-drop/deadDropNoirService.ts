@@ -4,9 +4,9 @@
  * Client-side ZK proof generation using NoirJS + bb.js (UltraHonk).
  *
  * Commitment = Poseidon2(x, y, salt)  (via Barretenberg WASM)
- * Circuit verifies (nuclear-keys responder design):
- *   1. Poseidon2(responder_x, responder_y, responder_salt) === expected_commitment
- *   2. wrappedManhattan(partial_dx, partial_dy, responder_x, responder_y) === expected_distance
+ * Circuit verifies (hidden-drop design):
+ *   1. Poseidon2(drop_x, drop_y, drop_salt) === expected_commitment
+ *   2. wrappedManhattan(ping_x, ping_y, drop_x, drop_y) === expected_distance
  */
 
 import { Noir } from '@noir-lang/noir_js';
@@ -36,13 +36,13 @@ export interface NoirProofResult {
 export interface NoirProvePingInput {
     sessionId: number;
     turn: number;
-    partialDx: number;
-    partialDy: number;
-    // Responder private inputs
-    responderX: number;
-    responderY: number;
-    responderSalt: Uint8Array;
-    responderCommitment: string; // hex, 32 bytes
+    pingX: number;
+    pingY: number;
+    // Hidden drop private inputs
+    dropX: number;
+    dropY: number;
+    dropSalt: Uint8Array;
+    dropCommitment: string; // hex, 32 bytes
 }
 
 // ============================================================================
@@ -119,40 +119,64 @@ export async function computeCommitmentNoir(
  * Generate a ZK proof for a ping using the Noir circuit.
  * Runs entirely in the browser via WASM.
  *
- * The responder generates this proof using only:
- * - their own secret share
- * - partial offsets sent by the pinger
+ * The backend prover generates this proof using:
+ * - hidden drop witness (x, y, salt)
+ * - public ping coordinates
  */
 export async function provePingNoir(input: NoirProvePingInput): Promise<NoirProofResult> {
     const { noir, backend } = await getNoirAndBackend();
 
     const distance = wrappedManhattan(
-        input.partialDx,
-        input.partialDy,
-        input.responderX,
-        input.responderY,
+        input.pingX,
+        input.pingY,
+        input.dropX,
+        input.dropY,
     );
 
-    const responderSaltBigInt = bytesToBigInt(input.responderSalt) % BN254_FR;
+    const dropSaltBigInt = bytesToBigInt(input.dropSalt) % BN254_FR;
 
     // Prepare witness inputs matching the Noir circuit's main() parameters.
     // Noir field inputs accept hex strings or decimal strings.
-    const witnessInput = {
+    const witnessInputNew = {
         // Private inputs
-        responder_x: input.responderX.toString(),
-        responder_y: input.responderY.toString(),
-        responder_salt: toFieldHex(responderSaltBigInt),
+        drop_x: input.dropX.toString(),
+        drop_y: input.dropY.toString(),
+        drop_salt: toFieldHex(dropSaltBigInt),
         // Public inputs
         session_id: input.sessionId.toString(),
         turn: input.turn.toString(),
-        partial_dx: input.partialDx.toString(),
-        partial_dy: input.partialDy.toString(),
-        expected_commitment: '0x' + input.responderCommitment.replace(/^0x/, ''),
+        ping_x: input.pingX.toString(),
+        ping_y: input.pingY.toString(),
+        expected_commitment: '0x' + input.dropCommitment.replace(/^0x/, ''),
+        expected_distance: distance.toString(),
+    };
+
+    // Legacy naming fallback for old circuit artifacts.
+    const witnessInputLegacy = {
+        // Private inputs
+        responder_x: input.dropX.toString(),
+        responder_y: input.dropY.toString(),
+        responder_salt: toFieldHex(dropSaltBigInt),
+        // Public inputs
+        session_id: input.sessionId.toString(),
+        turn: input.turn.toString(),
+        partial_dx: input.pingX.toString(),
+        partial_dy: input.pingY.toString(),
+        expected_commitment: '0x' + input.dropCommitment.replace(/^0x/, ''),
         expected_distance: distance.toString(),
     };
 
     // Generate witness + prove
-    const { witness } = await noir.execute(witnessInput);
+    let witness: Uint8Array;
+    try {
+        ({ witness } = await noir.execute(witnessInputNew));
+    } catch (newSchemaErr) {
+        try {
+            ({ witness } = await noir.execute(witnessInputLegacy));
+        } catch {
+            throw newSchemaErr;
+        }
+    }
     const proof = await backend.generateProof(witness);
 
     // Extract proof bytes and public inputs as hex strings

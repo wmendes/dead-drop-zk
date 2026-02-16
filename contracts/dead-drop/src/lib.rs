@@ -2,24 +2,15 @@
 
 //! # Dead Drop – 1v1 ZK Scavenger Hunt
 //!
-//! Two players each commit a secret coordinate on a 100×100 grid.
-//! The hidden "Drop" location is the modular sum of their secrets.
-//! Players alternate pinging the grid and a ZK proof verifies the
-//! Manhattan distance without revealing the responder's secret.
-//!
-//! **Game Hub Integration:**
-//! This game is Game Hub-aware. All sessions go through `start_game`
-//! and `end_game` on the Game Hub contract.
-//!
-//! **ZK Proof System:**
-//! Uses Noir + UltraHonk for client-side proof generation.
-//! Commitment = Poseidon2(x, y, salt) stored as BytesN<32>.
-//! Verification via cross-contract call to UltraHonk verifier.
+//! Two players compete to find a hidden drop location on a 100×100 toroidal grid.
+//! The hidden drop commitment is fixed at game start using a verifier-backed
+//! randomness attestation. Players alternate submitting pings; each ping includes
+//! exact public coordinates and a ZK proof that the reported distance is correct
+//! for the hidden committed drop.
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype,
-    Address, Bytes, BytesN, Env, IntoVal, InvokeError, Symbol, Val, Vec,
-    vec,
+    vec, Address, Bytes, BytesN, Env, IntoVal, InvokeError, Symbol, Val, Vec,
 };
 
 // ============================================================================
@@ -42,6 +33,21 @@ pub trait GameHub {
 }
 
 // ============================================================================
+// Randomness Verifier Interface
+// ============================================================================
+
+#[contractclient(name = "RandomnessVerifierClient")]
+pub trait RandomnessVerifier {
+    fn verify_randomness(
+        env: Env,
+        session_id: u32,
+        randomness_output: BytesN<32>,
+        drop_commitment: BytesN<32>,
+        randomness_signature: BytesN<64>,
+    ) -> bool;
+}
+
+// ============================================================================
 // Errors
 // ============================================================================
 
@@ -53,7 +59,7 @@ pub enum Error {
     NotPlayer = 2,
     GameAlreadyEnded = 3,
     InvalidGameStatus = 4,
-    AlreadyCommitted = 5,
+    // 5 reserved (was AlreadyCommitted)
     NotYourTurn = 6,
     InvalidTurn = 7,
     InvalidPublicInputs = 8,
@@ -65,6 +71,7 @@ pub enum Error {
     LobbyNotFound = 14,
     LobbyAlreadyExists = 15,
     SelfPlay = 16,
+    RandomnessVerificationFailed = 17,
 }
 
 // ============================================================================
@@ -76,10 +83,9 @@ pub enum Error {
 #[repr(u32)]
 pub enum GameStatus {
     Created = 0,
-    Committing = 1,
-    Active = 2,
-    Completed = 3,
-    Timeout = 4,
+    Active = 1,
+    Completed = 2,
+    Timeout = 3,
 }
 
 #[contracttype]
@@ -89,8 +95,7 @@ pub struct Game {
     pub player2: Address,
     pub player1_points: i128,
     pub player2_points: i128,
-    pub commitment1: BytesN<32>,
-    pub commitment2: BytesN<32>,
+    pub drop_commitment: BytesN<32>,
     pub status: GameStatus,
     pub current_turn: u32,
     pub whose_turn: u32, // 1 = player1 pings, 2 = player2 pings
@@ -116,6 +121,7 @@ pub enum DataKey {
     GameHubAddress,
     Admin,
     VerifierId,
+    RandomnessVerifierId,
 }
 
 // ============================================================================
@@ -140,11 +146,8 @@ const TIMEOUT_LEDGERS: u32 = 600;
 /// Sentinel value for "no distance recorded yet"
 const NO_DISTANCE: u32 = u32::MAX;
 
-/// Sentinel value for "no commitment yet"
-const EMPTY_COMMITMENT: [u8; 32] = [0u8; 32];
-
 /// Number of public inputs expected from the Noir circuit.
-/// [session_id, turn, partial_dx, partial_dy, responder_commitment, expected_distance]
+/// [session_id, turn, ping_x, ping_y, drop_commitment, expected_distance]
 const NUM_PUBLIC_INPUTS: usize = 6;
 
 // ============================================================================
@@ -162,6 +165,7 @@ impl DeadDropContract {
         admin: Address,
         game_hub: Address,
         verifier_id: Address,
+        randomness_verifier_id: Address,
     ) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -170,9 +174,14 @@ impl DeadDropContract {
         env.storage()
             .instance()
             .set(&DataKey::VerifierId, &verifier_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::RandomnessVerifierId, &randomness_verifier_id);
     }
 
     /// Start a new game session between two players.
+    ///
+    /// This is the legacy multi-sig flow where both players are known up-front.
     pub fn start_game(
         env: Env,
         session_id: u32,
@@ -180,6 +189,9 @@ impl DeadDropContract {
         player2: Address,
         player1_points: i128,
         player2_points: i128,
+        randomness_output: BytesN<32>,
+        drop_commitment: BytesN<32>,
+        randomness_signature: BytesN<64>,
     ) -> Result<(), Error> {
         // Points must be positive.
         if player1_points <= 0 || player2_points <= 0 {
@@ -209,6 +221,21 @@ impl DeadDropContract {
             vec![&env, session_id.into_val(&env), player2_points.into_val(&env)],
         );
 
+        // Verify randomness artifacts before starting the game.
+        let randomness_verifier_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RandomnessVerifierId)
+            .expect("RandomnessVerifierId not set");
+        verify_randomness(
+            &env,
+            &randomness_verifier_addr,
+            session_id,
+            &randomness_output,
+            &drop_commitment,
+            &randomness_signature,
+        )?;
+
         // Call Game Hub
         let game_hub_addr: Address = env
             .storage()
@@ -230,9 +257,8 @@ impl DeadDropContract {
             player2,
             player1_points,
             player2_points,
-            commitment1: BytesN::from_array(&env, &EMPTY_COMMITMENT),
-            commitment2: BytesN::from_array(&env, &EMPTY_COMMITMENT),
-            status: GameStatus::Created,
+            drop_commitment,
+            status: GameStatus::Active,
             current_turn: 0,
             whose_turn: 1,
             player1_best_distance: NO_DISTANCE,
@@ -249,82 +275,18 @@ impl DeadDropContract {
         Ok(())
     }
 
-    /// Submit a Poseidon2 commitment of the player's secret coordinates.
-    /// commitment = Poseidon2(x, y, salt) — 32 bytes big-endian
-    pub fn commit_secret(
-        env: Env,
-        session_id: u32,
-        player: Address,
-        commitment: BytesN<32>,
-    ) -> Result<(), Error> {
-        player.require_auth();
-
-        let key = DataKey::Game(session_id);
-        let mut game: Game = env
-            .storage()
-            .temporary()
-            .get(&key)
-            .ok_or(Error::GameNotFound)?;
-
-        if game.winner.is_some() {
-            return Err(Error::GameAlreadyEnded);
-        }
-
-        let empty = BytesN::from_array(&env, &EMPTY_COMMITMENT);
-
-        if player == game.player1 {
-            if game.commitment1 != empty {
-                return Err(Error::AlreadyCommitted);
-            }
-            game.commitment1 = commitment;
-        } else if player == game.player2 {
-            if game.commitment2 != empty {
-                return Err(Error::AlreadyCommitted);
-            }
-            game.commitment2 = commitment;
-        } else {
-            return Err(Error::NotPlayer);
-        }
-
-        // Transition status
-        let both_committed =
-            game.commitment1 != empty && game.commitment2 != empty;
-        if both_committed {
-            game.status = GameStatus::Active;
-        } else {
-            game.status = GameStatus::Committing;
-        }
-
-        game.last_action_ledger = env.ledger().sequence();
-
-        env.storage().temporary().set(&key, &game);
-        env.storage()
-            .temporary()
-            .extend_ttl(&key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
-
-        Ok(())
-    }
-
     /// Submit a ping result with ZK proof verification (Noir + UltraHonk).
     ///
-    /// The pinger sends partial offsets to the responder:
-    /// partial_dx = (ping_x - pinger_secret_x) mod 100
-    /// partial_dy = (ping_y - pinger_secret_y) mod 100
-    ///
-    /// The responder proves:
-    /// - their secret matches their commitment
-    /// - distance(partial, responder_secret) == expected_distance
-    ///
     /// Public inputs layout (6 x 32-byte big-endian field elements):
-    /// [session_id, turn, partial_dx, partial_dy, responder_commitment, expected_distance]
+    /// [session_id, turn, ping_x, ping_y, drop_commitment, expected_distance]
     pub fn submit_ping(
         env: Env,
         session_id: u32,
         player: Address,
         turn: u32,
         distance: u32,
-        partial_dx: u32,
-        partial_dy: u32,
+        ping_x: u32,
+        ping_y: u32,
         proof: Bytes,
         public_inputs: Vec<BytesN<32>>,
     ) -> Result<Option<Address>, Error> {
@@ -343,7 +305,7 @@ impl DeadDropContract {
         if game.status != GameStatus::Active {
             return Err(Error::InvalidGameStatus);
         }
-        if partial_dx >= GRID_SIZE || partial_dy >= GRID_SIZE {
+        if ping_x >= GRID_SIZE || ping_y >= GRID_SIZE {
             return Err(Error::InvalidDistance);
         }
         if distance > MAX_DISTANCE {
@@ -359,13 +321,11 @@ impl DeadDropContract {
         // Determine who is pinging and validate it's their turn
         let is_player1_turn = game.whose_turn == 1;
         let pinger = if is_player1_turn {
-            // Player1 is pinging
             if player != game.player1 {
                 return Err(Error::NotYourTurn);
             }
             &game.player1
         } else {
-            // Player2 is pinging
             if player != game.player2 {
                 return Err(Error::NotYourTurn);
             }
@@ -378,22 +338,13 @@ impl DeadDropContract {
         }
 
         // Reconstruct expected public inputs from on-chain state and submitted params.
-        // The responder commitment depends on turn:
-        // - if player1 is pinging, responder is player2
-        // - if player2 is pinging, responder is player1
-        let responder_commitment = if is_player1_turn {
-            &game.commitment2
-        } else {
-            &game.commitment1
-        };
-
         let expected_inputs = build_public_inputs(
             &env,
             session_id,
             turn,
-            partial_dx,
-            partial_dy,
-            responder_commitment,
+            ping_x,
+            ping_y,
+            &game.drop_commitment,
             distance,
         );
 
@@ -417,10 +368,10 @@ impl DeadDropContract {
 
         // Emit ping event for frontend syncing
         // Topic: ["ping", session_id]
-        // Data: [player, turn, distance, partial_dx, partial_dy]
+        // Data: [player, turn, distance, ping_x, ping_y]
         env.events().publish(
             (Symbol::new(&env, "ping"), session_id),
-            (player.clone(), turn, distance, partial_dx, partial_dy),
+            (player.clone(), turn, distance, ping_x, ping_y),
         );
 
         // Record distance and update best
@@ -428,10 +379,8 @@ impl DeadDropContract {
             if distance < game.player1_best_distance {
                 game.player1_best_distance = distance;
             }
-        } else {
-            if distance < game.player2_best_distance {
-                game.player2_best_distance = distance;
-            }
+        } else if distance < game.player2_best_distance {
+            game.player2_best_distance = distance;
         }
 
         // Check for immediate win (distance == 0 means found the drop)
@@ -605,6 +554,9 @@ impl DeadDropContract {
         session_id: u32,
         joiner: Address,
         joiner_points: i128,
+        randomness_output: BytesN<32>,
+        drop_commitment: BytesN<32>,
+        randomness_signature: BytesN<64>,
     ) -> Result<(), Error> {
         if joiner_points <= 0 {
             return Err(Error::InvalidDistance);
@@ -625,6 +577,21 @@ impl DeadDropContract {
             return Err(Error::SelfPlay);
         }
 
+        // Verify randomness artifacts before starting the game.
+        let randomness_verifier_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RandomnessVerifierId)
+            .expect("RandomnessVerifierId not set");
+        verify_randomness(
+            &env,
+            &randomness_verifier_addr,
+            session_id,
+            &randomness_output,
+            &drop_commitment,
+            &randomness_signature,
+        )?;
+
         // Consume the lobby
         env.storage().temporary().remove(&lobby_key);
 
@@ -644,15 +611,14 @@ impl DeadDropContract {
             &joiner_points,
         );
 
-        // Create the game
+        // Create the game directly as active (no commit phase).
         let game = Game {
             player1: lobby.host,
             player2: joiner,
             player1_points: lobby.host_points,
             player2_points: joiner_points,
-            commitment1: BytesN::from_array(&env, &EMPTY_COMMITMENT),
-            commitment2: BytesN::from_array(&env, &EMPTY_COMMITMENT),
-            status: GameStatus::Created,
+            drop_commitment,
+            status: GameStatus::Active,
             current_turn: 0,
             whose_turn: 1,
             player1_best_distance: NO_DISTANCE,
@@ -718,6 +684,25 @@ impl DeadDropContract {
             .set(&DataKey::GameHubAddress, &new_hub);
     }
 
+    pub fn get_randomness_verifier(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::RandomnessVerifierId)
+            .expect("RandomnessVerifierId not set")
+    }
+
+    pub fn set_randomness_verifier(env: Env, new_verifier: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::RandomnessVerifierId, &new_verifier);
+    }
+
     pub fn set_verifier(env: Env, new_verifier: Address) {
         let admin: Address = env
             .storage()
@@ -768,28 +753,28 @@ fn u32_to_field_bytes(env: &Env, value: u32) -> BytesN<32> {
 
 /// Build the expected public inputs vector from on-chain state.
 /// Order must match the Noir circuit's public input declarations:
-/// [session_id, turn, partial_dx, partial_dy, responder_commitment, expected_distance]
+/// [session_id, turn, ping_x, ping_y, drop_commitment, expected_distance]
 fn build_public_inputs(
     env: &Env,
     session_id: u32,
     turn: u32,
-    partial_dx: u32,
-    partial_dy: u32,
-    responder_commitment: &BytesN<32>,
+    ping_x: u32,
+    ping_y: u32,
+    drop_commitment: &BytesN<32>,
     distance: u32,
 ) -> Vec<BytesN<32>> {
     let mut inputs = Vec::new(env);
     inputs.push_back(u32_to_field_bytes(env, session_id));
     inputs.push_back(u32_to_field_bytes(env, turn));
-    inputs.push_back(u32_to_field_bytes(env, partial_dx));
-    inputs.push_back(u32_to_field_bytes(env, partial_dy));
-    inputs.push_back(responder_commitment.clone());
+    inputs.push_back(u32_to_field_bytes(env, ping_x));
+    inputs.push_back(u32_to_field_bytes(env, ping_y));
+    inputs.push_back(drop_commitment.clone());
     inputs.push_back(u32_to_field_bytes(env, distance));
     inputs
 }
 
 // ============================================================================
-// ZK Proof Verification (cross-contract call to UltraHonk verifier)
+// ZK Proof Verification (cross-contract call to verifier)
 // ============================================================================
 
 fn verify_proof(
@@ -810,6 +795,36 @@ fn verify_proof(
     match result {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(_)) | Err(_) => Err(Error::ProofVerificationFailed),
+    }
+}
+
+// ============================================================================
+// Randomness Verification (cross-contract call)
+// ============================================================================
+
+fn verify_randomness(
+    env: &Env,
+    verifier_id: &Address,
+    session_id: u32,
+    randomness_output: &BytesN<32>,
+    drop_commitment: &BytesN<32>,
+    randomness_signature: &BytesN<64>,
+) -> Result<(), Error> {
+    let mut args: Vec<Val> = Vec::new(env);
+    args.push_back(session_id.into_val(env));
+    args.push_back(randomness_output.into_val(env));
+    args.push_back(drop_commitment.into_val(env));
+    args.push_back(randomness_signature.into_val(env));
+
+    let result = env.try_invoke_contract::<bool, InvokeError>(
+        verifier_id,
+        &Symbol::new(env, "verify_randomness"),
+        args,
+    );
+
+    match result {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(Error::RandomnessVerificationFailed),
     }
 }
 

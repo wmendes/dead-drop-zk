@@ -1,7 +1,8 @@
 const http = require("node:http");
+const { createHash, randomBytes } = require("node:crypto");
 const { WebSocketServer } = require("ws");
 const { Keypair, TransactionBuilder, BASE_FEE, Networks, Operation, xdr } = require("@stellar/stellar-sdk");
-const { provePing } = require("./prover");
+const { provePing, computeDropCommitment } = require("./prover");
 const { submitSorobanViaRelayer, getRpcServer, normalizeBase64, tryExtractHostFunction } = require("./relayer");
 
 const PING_GRID_SIZE = 100;
@@ -126,9 +127,48 @@ function sendWsJson(ws, payload) {
   ws.send(JSON.stringify(payload));
 }
 
+function u32ToBuffer(value) {
+  const buf = Buffer.alloc(4);
+  buf.writeUInt32BE(value, 0);
+  return buf;
+}
+
+function computeRandomnessOutputHex(sessionId, dropCommitmentHex, randomnessSignatureHex) {
+  const digest = createHash("sha256");
+  digest.update(u32ToBuffer(sessionId));
+  digest.update(Buffer.from(dropCommitmentHex, "hex"));
+  digest.update(Buffer.from(randomnessSignatureHex, "hex"));
+  return digest.digest("hex");
+}
+
+function createHiddenDropArtifacts(sessionId) {
+  const drop_x = randomBytes(2).readUInt16BE(0) % PING_GRID_SIZE;
+  const drop_y = randomBytes(2).readUInt16BE(0) % PING_GRID_SIZE;
+  const drop_salt_hex = randomBytes(32).toString("hex");
+  const drop_commitment_hex = computeDropCommitment(drop_x, drop_y, drop_salt_hex);
+  const randomness_signature_hex = randomBytes(64).toString("hex");
+  const randomness_output_hex = computeRandomnessOutputHex(
+    sessionId,
+    drop_commitment_hex,
+    randomness_signature_hex
+  );
+
+  return {
+    session_id: sessionId,
+    drop_x,
+    drop_y,
+    drop_salt_hex,
+    drop_commitment_hex,
+    randomness_signature_hex,
+    randomness_output_hex,
+    created_at_ms: Date.now(),
+  };
+}
+
 function createServer(options = {}) {
   const relayStore = options.relayStore || new Map();
   const webrtcPeersBySession = options.webrtcPeersBySession || new Map();
+  const hiddenDropBySession = options.hiddenDropBySession || new Map();
 
   function getSessionPeers(sessionId) {
     let peers = webrtcPeersBySession.get(sessionId);
@@ -162,6 +202,37 @@ function createServer(options = {}) {
     removeSessionIfEmpty(sessionId, peers);
   }
 
+  async function handleRandomnessSession(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      sendError(res, 400, err.message);
+      return;
+    }
+
+    let sessionId;
+    try {
+      sessionId = parseU32(body.session_id, "session_id");
+    } catch (err) {
+      sendError(res, 400, err.message);
+      return;
+    }
+
+    let entry = hiddenDropBySession.get(sessionId);
+    if (!entry) {
+      entry = createHiddenDropArtifacts(sessionId);
+      hiddenDropBySession.set(sessionId, entry);
+    }
+
+    sendJson(res, 200, {
+      session_id: sessionId,
+      randomness_output_hex: entry.randomness_output_hex,
+      randomness_signature_hex: entry.randomness_signature_hex,
+      drop_commitment_hex: entry.drop_commitment_hex,
+    });
+  }
+
   async function handleProvePing(req, res) {
     let body;
     try {
@@ -176,30 +247,37 @@ function createServer(options = {}) {
       input = {
         session_id: parseU32(body.session_id, "session_id"),
         turn: parseU32(body.turn, "turn"),
-        partial_dx: parseU32(body.partial_dx, "partial_dx"),
-        partial_dy: parseU32(body.partial_dy, "partial_dy"),
-        responder_x: parseU32(body.responder_x, "responder_x"),
-        responder_y: parseU32(body.responder_y, "responder_y"),
-        responder_salt_hex: normalizeHex(body.responder_salt_hex, "responder_salt_hex", 32),
-        responder_commitment_hex: normalizeHex(body.responder_commitment_hex, "responder_commitment_hex", 32),
+        ping_x: parseU32(body.ping_x, "ping_x"),
+        ping_y: parseU32(body.ping_y, "ping_y"),
       };
     } catch (err) {
       sendError(res, 400, err.message);
       return;
     }
 
-    if (
-      input.partial_dx >= PING_GRID_SIZE
-      || input.partial_dy >= PING_GRID_SIZE
-      || input.responder_x >= PING_GRID_SIZE
-      || input.responder_y >= PING_GRID_SIZE
-    ) {
-      sendError(res, 400, `partial/responder coordinates must be in [0, ${PING_GRID_SIZE - 1}]`);
+    if (input.ping_x >= PING_GRID_SIZE || input.ping_y >= PING_GRID_SIZE) {
+      sendError(res, 400, `ping coordinates must be in [0, ${PING_GRID_SIZE - 1}]`);
+      return;
+    }
+
+    const hiddenDrop = hiddenDropBySession.get(input.session_id);
+    if (!hiddenDrop) {
+      sendError(
+        res,
+        404,
+        "Session randomness not initialized. Call POST /randomness/session first."
+      );
       return;
     }
 
     try {
-      const proof = await provePing(input);
+      const proof = await provePing({
+        ...input,
+        drop_x: hiddenDrop.drop_x,
+        drop_y: hiddenDrop.drop_y,
+        drop_salt_hex: hiddenDrop.drop_salt_hex,
+        drop_commitment_hex: hiddenDrop.drop_commitment_hex,
+      });
       sendJson(res, 200, {
         distance: proof.distance,
         proof_hex: proof.proofHex,
@@ -550,6 +628,11 @@ function createServer(options = {}) {
 
     if (req.method === "GET" && url.pathname === "/") {
       sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/randomness/session") {
+      await handleRandomnessSession(req, res);
       return;
     }
 

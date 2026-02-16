@@ -43,4 +43,17 @@ export interface ContractSigner {
    * (e.g. smart-account passkey flows) before custom submission.
    */
   signAssembledTransaction?: (tx: AssembledTransaction<unknown>) => Promise<void>;
+
+  /**
+   * Optional hook to execute an assembled transaction end-to-end without invoking
+   * the default auth-entry signing path (e.g. delegated/session signer flows).
+   */
+  executeAssembledTransaction?: (
+    tx: AssembledTransaction<unknown>
+  ) => Promise<{
+    success: boolean;
+    hash: string;
+    error?: string;
+    ledger?: number;
+  }>;
 }

@@ -8,6 +8,11 @@ import { Buffer } from 'buffer';
 import { useWalletStore } from '../store/walletSlice';
 import { devWalletService, DevWalletService } from '../services/devWalletService';
 import {
+  clearDeadDropSessionSignerState,
+  executeDeadDropWithSessionSigner,
+  scheduleDeadDropSessionSignerCleanup,
+} from '../services/deadDropSessionSignerService';
+import {
   NETWORK,
   NETWORK_PASSPHRASE,
   RPC_URL,
@@ -29,6 +34,15 @@ let smartCredentialId: string | null = null;
 let smartAccountCodeStatus: 'unknown' | 'available' | 'missing' = 'unknown';
 
 type WalletMode = 'dev' | 'wallet' | 'smart-account' | 'hybrid';
+const DEAD_DROP_SESSION_TTL_MINUTES = 60;
+
+interface ContractSignerOptions {
+  preferSessionSigner?: boolean;
+  sessionContractId?: string;
+  sessionTtlMinutes?: number;
+  sessionPhase?: 'setup' | 'gameplay';
+  sessionId?: number;
+}
 
 function isMissingSmartAccountContractMessage(message: string): boolean {
   return (
@@ -169,10 +183,15 @@ export function useWallet() {
     network,
     networkPassphrase,
     error,
+    walletOperation,
+    walletStage,
+    walletStageMessage,
     setWallet,
-    setConnecting,
     setNetwork,
-    setError,
+    startWalletOperation,
+    setWalletStage,
+    completeWalletOperation,
+    failWalletOperation,
     disconnect: storeDisconnect,
   } = useWalletStore();
 
@@ -188,22 +207,30 @@ export function useWallet() {
       }
 
       try {
-        setConnecting(true);
-        setError(null);
+        startWalletOperation('switch-dev', 'validating', `Preparing Player ${playerNumber} wallet...`);
 
         await devWalletService.initPlayer(playerNumber);
+        setWalletStage('finalizing', `Finalizing Player ${playerNumber} wallet session...`);
         const address = devWalletService.getPublicKey();
         setWallet(address, `dev-player${playerNumber}`, 'dev');
         setNetwork(NETWORK, NETWORK_PASSPHRASE);
+        completeWalletOperation(`Player ${playerNumber} wallet ready.`);
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : 'Failed to connect dev wallet';
-        setError(errorMessage);
+        failWalletOperation(errorMessage);
         throw err;
-      } finally {
-        setConnecting(false);
       }
     },
-    [supportsDev, walletMode, setWallet, setConnecting, setError, setNetwork]
+    [
+      supportsDev,
+      walletMode,
+      setWallet,
+      setNetwork,
+      startWalletOperation,
+      setWalletStage,
+      completeWalletOperation,
+      failWalletOperation,
+    ]
   );
 
   const connectWallet = useCallback(async () => {
@@ -216,24 +243,33 @@ export function useWallet() {
     }
 
     try {
-      setConnecting(true);
-      setError(null);
+      startWalletOperation('connect-wallet', 'validating', 'Preparing wallet connection...');
       ensureWalletKitInitialized(NETWORK_PASSPHRASE);
+      setWalletStage('opening_wallet', 'Waiting for wallet approval...');
       const { address } = await StellarWalletsKit.authModal();
       if (typeof address !== 'string' || !address) {
         throw new Error('No wallet address returned');
       }
 
+      setWalletStage('finalizing', 'Finalizing wallet session...');
       setWallet(address, WALLET_ID, 'wallet');
       setNetwork(NETWORK, NETWORK_PASSPHRASE);
+      completeWalletOperation('Wallet connected.');
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to connect wallet';
-      setError(message);
+      failWalletOperation(message);
       throw err;
-    } finally {
-      setConnecting(false);
     }
-  }, [supportsWalletKit, walletMode, setConnecting, setError, setWallet, setNetwork]);
+  }, [
+    supportsWalletKit,
+    walletMode,
+    setWallet,
+    setNetwork,
+    startWalletOperation,
+    setWalletStage,
+    completeWalletOperation,
+    failWalletOperation,
+  ]);
 
   const connectSmartAccount = useCallback(async () => {
     if (!supportsSmartAccount) {
@@ -245,30 +281,40 @@ export function useWallet() {
     }
 
     try {
-      setConnecting(true);
-      setError(null);
+      startWalletOperation('connect-passkey', 'validating', 'Checking passkey wallet configuration...');
       await ensureSmartAccountWasmIsDeployed();
       const kit = getSmartAccountKit();
+      setWalletStage('opening_passkey_prompt', 'Approve passkey authentication to continue...');
       const result = await kit.connectWallet({ prompt: true });
       if (!result) {
         throw new Error('No smart account found. Create one with "Create Passkey Wallet".');
       }
 
       smartCredentialId = result.credentialId;
+      clearDeadDropSessionSignerState(kit);
+      setWalletStage('finalizing', 'Finalizing passkey wallet session...');
       setWallet(result.contractId, SMART_ACCOUNT_ID, 'smart-account');
       setNetwork(NETWORK, NETWORK_PASSPHRASE);
+      completeWalletOperation('Passkey wallet connected.');
     } catch (err) {
       const rawMessage = err instanceof Error ? err.message : 'Failed to connect smart account';
       const message =
         isMissingSmartAccountContractMessage(rawMessage)
           ? 'No deployed smart account found for this passkey. Create a passkey wallet first.'
           : rawMessage;
-      setError(message);
+      failWalletOperation(message);
       throw err;
-    } finally {
-      setConnecting(false);
     }
-  }, [supportsSmartAccount, walletMode, setConnecting, setError, setWallet, setNetwork]);
+  }, [
+    supportsSmartAccount,
+    walletMode,
+    setWallet,
+    setNetwork,
+    startWalletOperation,
+    setWalletStage,
+    completeWalletOperation,
+    failWalletOperation,
+  ]);
 
   const createSmartAccount = useCallback(
     async (userName: string) => {
@@ -281,14 +327,16 @@ export function useWallet() {
       }
 
       try {
-        setConnecting(true);
-        setError(null);
+        startWalletOperation('create-passkey', 'validating', 'Checking passkey wallet configuration...');
         await ensureSmartAccountWasmIsDeployed();
         const kit = getSmartAccountKit();
+        setWalletStage('opening_passkey_prompt', 'Approve passkey registration to create your wallet...');
+        setWalletStage('creating_passkey', 'Creating passkey credentials...');
         const result = await kit.createWallet(SMART_ACCOUNT_RP_NAME, userName, {
           autoSubmit: true,
         });
 
+        setWalletStage('deploying_account', 'Deploying smart account on-chain...');
         if (result.submitResult && !result.submitResult.success) {
           throw new Error(
             `Smart account deployment failed: ${result.submitResult.error || 'unknown error'}`
@@ -299,6 +347,7 @@ export function useWallet() {
         // Retry briefly because RPC visibility can lag right after submission.
         let connected = false;
         let lastConnectError: unknown;
+        setWalletStage('finalizing', 'Verifying deployed wallet and finalizing session...');
         for (let attempt = 0; attempt < 5; attempt += 1) {
           try {
             await kit.connectWallet({
@@ -321,20 +370,29 @@ export function useWallet() {
         }
 
         smartCredentialId = result.credentialId;
+        clearDeadDropSessionSignerState(kit);
         setWallet(result.contractId, SMART_ACCOUNT_ID, 'smart-account');
         setNetwork(NETWORK, NETWORK_PASSPHRASE);
+        completeWalletOperation('Passkey wallet created and connected.');
       } catch (err) {
         const rawMessage = err instanceof Error ? err.message : 'Failed to create smart account';
         const message = isMissingSmartAccountContractMessage(rawMessage)
           ? 'Passkey created, but no deployed smart account was found on-chain yet. Check relayer submission and try again.'
           : rawMessage;
-        setError(message);
+        failWalletOperation(message);
         throw err;
-      } finally {
-        setConnecting(false);
       }
     },
-    [supportsSmartAccount, walletMode, setConnecting, setError, setWallet, setNetwork]
+    [
+      supportsSmartAccount,
+      walletMode,
+      setWallet,
+      setNetwork,
+      startWalletOperation,
+      setWalletStage,
+      completeWalletOperation,
+      failWalletOperation,
+    ]
   );
 
   const switchPlayer = useCallback(
@@ -344,20 +402,19 @@ export function useWallet() {
       }
 
       try {
-        setConnecting(true);
-        setError(null);
+        startWalletOperation('switch-dev', 'validating', `Switching to Player ${playerNumber}...`);
         await devWalletService.switchPlayer(playerNumber);
+        setWalletStage('finalizing', `Finalizing Player ${playerNumber} session...`);
         const address = devWalletService.getPublicKey();
         setWallet(address, `dev-player${playerNumber}`, 'dev');
+        completeWalletOperation(`Switched to Player ${playerNumber}.`);
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : 'Failed to switch player';
-        setError(errorMessage);
+        failWalletOperation(errorMessage);
         throw err;
-      } finally {
-        setConnecting(false);
       }
     },
-    [walletType, setWallet, setConnecting, setError]
+    [walletType, setWallet, startWalletOperation, setWalletStage, completeWalletOperation, failWalletOperation]
   );
 
   const refresh = useCallback(async () => {
@@ -369,6 +426,7 @@ export function useWallet() {
         const smartSession = await kit.connectWallet();
         if (smartSession) {
           smartCredentialId = smartSession.credentialId;
+          clearDeadDropSessionSignerState(kit);
           setWallet(smartSession.contractId, SMART_ACCOUNT_ID, 'smart-account');
           setNetwork(NETWORK, NETWORK_PASSPHRASE);
           return;
@@ -423,6 +481,7 @@ export function useWallet() {
     if (walletType === 'smart-account') {
       try {
         const kit = getSmartAccountKit();
+        clearDeadDropSessionSignerState(kit);
         await kit.disconnect();
       } catch {
         // noop
@@ -430,10 +489,28 @@ export function useWallet() {
       smartCredentialId = null;
     }
 
+    if (walletType !== 'smart-account') {
+      clearDeadDropSessionSignerState();
+    }
+
     storeDisconnect();
   }, [walletType, storeDisconnect]);
 
-  const getContractSigner = useCallback((): ContractSigner => {
+  const releaseDeadDropSessionSigner = useCallback(() => {
+    if (walletType !== 'smart-account') {
+      clearDeadDropSessionSignerState();
+      return;
+    }
+
+    try {
+      const kit = getSmartAccountKit();
+      scheduleDeadDropSessionSignerCleanup(kit);
+    } catch {
+      clearDeadDropSessionSignerState();
+    }
+  }, [walletType]);
+
+  const getContractSigner = useCallback((options?: ContractSignerOptions): ContractSigner => {
     if (!isConnected || !publicKey || !walletType) {
       throw new Error('Wallet not connected');
     }
@@ -494,7 +571,7 @@ export function useWallet() {
       };
     }
 
-    return {
+    const smartAccountSigner: ContractSigner = {
       signTransaction: async (
         txXdr: string,
         opts?: { networkPassphrase?: string }
@@ -573,6 +650,30 @@ export function useWallet() {
         }
       },
     };
+
+    if (!options?.preferSessionSigner || !options.sessionContractId || NETWORK !== 'testnet') {
+      return smartAccountSigner;
+    }
+
+    const sessionPhase = options.sessionPhase ?? 'setup';
+    const allowProvisioning = sessionPhase !== 'gameplay';
+
+    return {
+      ...smartAccountSigner,
+      executeAssembledTransaction: async (tx) => {
+        const kit = getSmartAccountKit();
+        return executeDeadDropWithSessionSigner({
+          kit,
+          credentialId: smartCredentialId,
+          walletContractId: publicKey,
+          gameContractId: options.sessionContractId!,
+          sessionId: options.sessionId,
+          ttlMinutes: options.sessionTtlMinutes ?? DEAD_DROP_SESSION_TTL_MINUTES,
+          allowProvisioning,
+          tx,
+        });
+      },
+    };
   }, [isConnected, publicKey, walletType, networkPassphrase]);
 
   const isDevModeAvailable = useCallback(() => supportsDev && DevWalletService.isDevModeAvailable(), [supportsDev]);
@@ -600,6 +701,7 @@ export function useWallet() {
           const smartSession = await kit.connectWallet();
           if (smartSession && (walletMode === 'smart-account' || !isConnected)) {
             smartCredentialId = smartSession.credentialId;
+            clearDeadDropSessionSignerState(kit);
             setWallet(smartSession.contractId, SMART_ACCOUNT_ID, 'smart-account');
             return;
           }
@@ -661,6 +763,11 @@ export function useWallet() {
 
   const isSmartAccountReady = supportsSmartAccount && smartAccountConfigured();
 
+  useEffect(() => {
+    if (walletType === 'smart-account') return;
+    clearDeadDropSessionSignerState();
+  }, [walletType]);
+
   return {
     publicKey,
     walletId,
@@ -670,6 +777,9 @@ export function useWallet() {
     network,
     networkPassphrase,
     error,
+    walletOperation,
+    walletStage,
+    walletStageMessage,
     walletMode,
     isWalletAvailable: typeof window !== 'undefined',
     isSmartAccountReady,
@@ -682,6 +792,7 @@ export function useWallet() {
     connectDev,
     switchPlayer,
     disconnect,
+    releaseDeadDropSessionSigner,
     getContractSigner,
     isDevModeAvailable,
     isDevPlayerAvailable,

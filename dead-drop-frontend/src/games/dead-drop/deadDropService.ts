@@ -13,19 +13,27 @@ import { Buffer } from 'buffer';
 import { signAndSendViaLaunchtube } from '@/utils/transactionHelper';
 import { calculateValidUntilLedger } from '@/utils/ledgerUtils';
 import { injectSignedAuthEntry } from '@/utils/authEntryUtils';
+import type { ContractSigner } from '@/types/signer';
 
 type ClientOptions = contract.ClientOptions;
+type ClientSigner = Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>;
+type MutationSigner = ClientSigner & Pick<ContractSigner, 'executeAssembledTransaction'>;
 
 /**
  * Service for interacting with the Dead Drop game contract.
  *
  * Contract methods:
  * - start_game: multi-sig (Player1 + Player2)
- * - commit_secret: single-sig
  * - submit_ping: single-sig (with ZK proof data)
  * - force_timeout: single-sig
  * - get_game: read-only
  */
+export interface DeadDropRandomnessArtifacts {
+  randomnessOutput: Buffer;
+  dropCommitment: Buffer;
+  randomnessSignature: Buffer;
+}
+
 export class DeadDropService {
   private baseClient: DeadDropClient;
   private contractId: string;
@@ -53,7 +61,7 @@ export class DeadDropService {
 
   private createSigningClient(
     publicKey: string,
-    signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>
+    signer: ClientSigner
   ): DeadDropClient {
     return new DeadDropClient({
       contractId: this.contractId,
@@ -62,6 +70,13 @@ export class DeadDropService {
       publicKey: this.resolveInvokerPublicKey(publicKey),
       ...signer,
     });
+  }
+
+  private toClientSigner(signer: ClientSigner | MutationSigner): ClientSigner {
+    return {
+      signTransaction: signer.signTransaction,
+      signAuthEntry: signer.signAuthEntry,
+    };
   }
 
   private ensureMutationSubmitted(
@@ -82,6 +97,64 @@ export class DeadDropService {
         `${action} did not submit to the network (no transaction hash/status returned).`
       );
     }
+  }
+
+  private async submitMutation(
+    action: string,
+    tx: contract.AssembledTransaction<unknown>,
+    signer: MutationSigner,
+    authTtlMinutes: number = DEFAULT_AUTH_TTL_MINUTES,
+    allowWalletFallback: boolean = true,
+  ): Promise<contract.SentTransaction<any>> {
+    if (signer.executeAssembledTransaction) {
+      try {
+        const executionResult = await signer.executeAssembledTransaction(tx);
+        if (executionResult.success) {
+          return {
+            result: undefined,
+            getTransactionResponse: {
+              status: 'SUCCESS',
+              hash: executionResult.hash,
+              ledger: executionResult.ledger,
+            },
+          } as unknown as contract.SentTransaction<any>;
+        }
+
+        if (!allowWalletFallback) {
+          throw new Error(
+            executionResult.error
+              || 'Dead Drop session signer is unavailable. Re-open or re-join the lobby to continue.'
+          );
+        }
+
+        console.warn(
+          `[DeadDropService] ${action}: session signer path failed, falling back to direct wallet signer.`,
+          executionResult.error || 'unknown error'
+        );
+      } catch (error) {
+        if (!allowWalletFallback) {
+          if (error instanceof Error) {
+            throw error;
+          }
+          throw new Error(
+            `Dead Drop session signer failed: ${String(error)}. Re-open or re-join the lobby to continue.`
+          );
+        }
+
+        console.warn(
+          `[DeadDropService] ${action}: session signer threw, falling back to direct wallet signer.`,
+          error
+        );
+      }
+    }
+
+    const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, authTtlMinutes);
+    return signAndSendViaLaunchtube(
+      tx,
+      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+      this.toClientSigner(signer),
+      validUntilLedgerSeq
+    );
   }
 
   // ========================================================================
@@ -124,6 +197,7 @@ export class DeadDropService {
     player2: string,
     player1Points: bigint,
     player2Points: bigint,
+    randomness: DeadDropRandomnessArtifacts,
     player1Signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>,
     authTtlMinutes?: number
   ): Promise<string> {
@@ -140,6 +214,9 @@ export class DeadDropService {
       player2,
       player1_points: player1Points,
       player2_points: player2Points,
+      randomness_output: randomness.randomnessOutput,
+      drop_commitment: randomness.dropCommitment,
+      randomness_signature: randomness.randomnessSignature,
     }, DEFAULT_METHOD_OPTIONS);
 
     if (!tx.simulationData?.result?.auth) {
@@ -221,6 +298,7 @@ export class DeadDropService {
     player1SignedAuthEntryXdr: string,
     player2Address: string,
     player2Points: bigint,
+    randomness: DeadDropRandomnessArtifacts,
     player2Signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>,
     authTtlMinutes?: number
   ): Promise<string> {
@@ -242,6 +320,9 @@ export class DeadDropService {
       player2: player2Address,
       player1_points: gameParams.player1Points,
       player2_points: player2Points,
+      randomness_output: randomness.randomnessOutput,
+      drop_commitment: randomness.dropCommitment,
+      randomness_signature: randomness.randomnessSignature,
     }, DEFAULT_METHOD_OPTIONS);
 
     const validUntilLedgerSeq = await calculateValidUntilLedger(
@@ -295,6 +376,7 @@ export class DeadDropService {
     sessionId: number,
     player1Address: string,
     player2Address: string,
+    randomness: DeadDropRandomnessArtifacts,
     player1Signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>,
     player2Signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>,
     stakePoints: bigint,
@@ -315,6 +397,9 @@ export class DeadDropService {
       player2: player2Address,
       player1_points: stakePoints,
       player2_points: stakePoints,
+      randomness_output: randomness.randomnessOutput,
+      drop_commitment: randomness.dropCommitment,
+      randomness_signature: randomness.randomnessSignature,
     }, DEFAULT_METHOD_OPTIONS);
 
     if (!tx.simulationData?.result?.auth) {
@@ -396,21 +481,21 @@ export class DeadDropService {
     sessionId: number,
     hostAddress: string,
     hostPoints: bigint,
-    signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>
+    signer: MutationSigner
   ) {
-    const client = this.createSigningClient(hostAddress, signer);
+    const client = this.createSigningClient(hostAddress, this.toClientSigner(signer));
     const tx = await client.open_game({
       session_id: sessionId,
       host: hostAddress,
       host_points: hostPoints,
     }, DEFAULT_METHOD_OPTIONS);
 
-    const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
-    const sentTx = await signAndSendViaLaunchtube(
-      tx,
-      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+    const sentTx = await this.submitMutation(
+      'open_game',
+      tx as contract.AssembledTransaction<unknown>,
       signer,
-      validUntilLedgerSeq
+      DEFAULT_AUTH_TTL_MINUTES,
+      false,
     );
     this.ensureMutationSubmitted('open_game', sentTx);
     return sentTx;
@@ -420,82 +505,78 @@ export class DeadDropService {
     sessionId: number,
     joinerAddress: string,
     joinerPoints: bigint,
-    signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>
+    randomness: DeadDropRandomnessArtifacts,
+    signer: MutationSigner
   ) {
-    const client = this.createSigningClient(joinerAddress, signer);
+    const client = this.createSigningClient(joinerAddress, this.toClientSigner(signer));
     const tx = await client.join_game({
       session_id: sessionId,
       joiner: joinerAddress,
       joiner_points: joinerPoints,
+      randomness_output: randomness.randomnessOutput,
+      drop_commitment: randomness.dropCommitment,
+      randomness_signature: randomness.randomnessSignature,
     }, DEFAULT_METHOD_OPTIONS);
 
-    const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
-    const sentTx = await signAndSendViaLaunchtube(
-      tx,
-      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
-      signer,
-      validUntilLedgerSeq
-    );
-    return sentTx.result;
+    try {
+      const sentTx = await this.submitMutation(
+        'join_game',
+        tx as contract.AssembledTransaction<unknown>,
+        signer,
+        DEFAULT_AUTH_TTL_MINUTES,
+        false,
+      );
+      return sentTx.result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (
+        msg.includes('MismatchingParameterLen')
+        || msg.includes('UnexpectedSize')
+        || msg.includes('join_game')
+      ) {
+        throw new Error(
+          'Dead Drop contract ABI mismatch: the deployed contract appears outdated. ' +
+          'Redeploy dead-drop + mock-verifier and update VITE_DEAD_DROP_CONTRACT_ID.'
+        );
+      }
+      throw err;
+    }
   }
 
   // ========================================================================
   // Single-sig game actions
   // ========================================================================
 
-  async commitSecret(
-    sessionId: number,
-    playerAddress: string,
-    commitment: Buffer,
-    signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>
-  ) {
-    const client = this.createSigningClient(playerAddress, signer);
-    const tx = await client.commit_secret({
-      session_id: sessionId,
-      player: playerAddress,
-      commitment,
-    }, DEFAULT_METHOD_OPTIONS);
-
-    const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
-    const sentTx = await signAndSendViaLaunchtube(
-      tx,
-      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
-      signer,
-      validUntilLedgerSeq
-    );
-    return sentTx.result;
-  }
-
   async submitPing(
     sessionId: number,
     playerAddress: string,
     turn: number,
     distance: number,
-    partialDx: number,
-    partialDy: number,
+    pingX: number,
+    pingY: number,
     proof: Buffer,
     publicInputs: Buffer[],
-    signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>
+    signer: MutationSigner
   ) {
-    const client = this.createSigningClient(playerAddress, signer);
+    const client = this.createSigningClient(playerAddress, this.toClientSigner(signer));
     const tx = await client.submit_ping({
       session_id: sessionId,
       player: playerAddress,
       turn,
       distance,
-      partial_dx: partialDx,
-      partial_dy: partialDy,
+      ping_x: pingX,
+      ping_y: pingY,
       proof,
       public_inputs: publicInputs,
     }, DEFAULT_METHOD_OPTIONS);
 
-    const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
     try {
-      const sentTx = await signAndSendViaLaunchtube(
-        tx,
-        DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+      const sentTx = await this.submitMutation(
+        'submit_ping',
+        tx as contract.AssembledTransaction<unknown>,
         signer,
-        validUntilLedgerSeq,
+        DEFAULT_AUTH_TTL_MINUTES,
+        false,
       );
       if (sentTx.getTransactionResponse?.status === 'FAILED') {
         throw new Error('Transaction failed');
@@ -591,20 +672,20 @@ export class DeadDropService {
   async forceTimeout(
     sessionId: number,
     playerAddress: string,
-    signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>
+    signer: MutationSigner
   ) {
-    const client = this.createSigningClient(playerAddress, signer);
+    const client = this.createSigningClient(playerAddress, this.toClientSigner(signer));
     const tx = await client.force_timeout({
       session_id: sessionId,
       player: playerAddress,
     }, DEFAULT_METHOD_OPTIONS);
 
-    const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
-    const sentTx = await signAndSendViaLaunchtube(
-      tx,
-      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+    const sentTx = await this.submitMutation(
+      'force_timeout',
+      tx as contract.AssembledTransaction<unknown>,
       signer,
-      validUntilLedgerSeq
+      DEFAULT_AUTH_TTL_MINUTES,
+      false,
     );
     return sentTx.result;
   }

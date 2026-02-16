@@ -1,11 +1,15 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { MapContainer, TileLayer, CircleMarker, useMapEvents, useMap, Pane } from 'react-leaflet';
+import { MapContainer, TileLayer, CircleMarker, useMapEvents, useMap } from 'react-leaflet';
 import type { LeafletMouseEvent } from 'leaflet';
 
 const GRID_SIZE = 100;
+const MAP_CENTER: [number, number] = [20, 0];
+const MAP_DEFAULT_ZOOM = 2;
+const MAP_MIN_ZOOM = 2;
+const MAP_MAX_ZOOM = 4;
+const MAP_BOUNDS: [[number, number], [number, number]] = [[-85, -180], [85, 180]];
 
 type TemperatureZone = 'FOUND' | 'HOT' | 'WARM' | 'COOL' | 'COLD';
-type CoordVisibility = 'exact' | 'unknown';
 
 interface PingResult {
   turn: number;
@@ -14,7 +18,6 @@ interface PingResult {
   distance: number;
   zone: TemperatureZone;
   player: string;
-  coordVisibility: CoordVisibility;
 }
 
 function getZoneColor(zone: TemperatureZone): string {
@@ -103,7 +106,6 @@ export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, 
   }, [interactive, onCellSelect]);
 
   const pingMarkers = useMemo(() => pingHistory
-    .filter((ping) => ping.coordVisibility === 'exact')
     .map((ping, i) => {
     const pos = gridToLatLng(ping.x, ping.y);
     const color = getZoneColor(ping.zone);
@@ -123,13 +125,6 @@ export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, 
       />
     );
   }), [pingHistory, userAddress]);
-
-  const unknownOpponentPingCount = useMemo(() => {
-    if (!userAddress) return 0;
-    return pingHistory.filter(
-      (ping) => ping.player !== userAddress && ping.coordVisibility === 'unknown'
-    ).length;
-  }, [pingHistory, userAddress]);
 
   const selectedMarker = useMemo(() => {
     if (!selectedCell) return null;
@@ -200,8 +195,12 @@ export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, 
         `}
       >
         <MapContainer
-          center={[20, 0]}
-          zoom={2}
+          center={MAP_CENTER}
+          zoom={MAP_DEFAULT_ZOOM}
+          minZoom={MAP_MIN_ZOOM}
+          maxZoom={MAP_MAX_ZOOM}
+          maxBounds={MAP_BOUNDS}
+          maxBoundsViscosity={1}
           zoomControl={false}
           worldCopyJump={true}
           attributionControl={false}
@@ -214,11 +213,6 @@ export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, 
             opacity={1}
           />
 
-          {/* Overlay grid effect */}
-          <Pane name="customGridPane" style={{ zIndex: 400, pointerEvents: 'none' }}>
-            <div className="absolute inset-0 bg-[url('/grid-pattern.png')] opacity-10 pointer-events-none mix-blend-overlay"></div>
-          </Pane>
-
           {interactive && <MapClickHandler onCellSelect={handleCellSelect} />}
           {interactive && <CoordOverlay />}
 
@@ -226,21 +220,6 @@ export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, 
           {selectedMarker}
           {debugMarkers}
         </MapContainer>
-
-        {unknownOpponentPingCount > 0 && (
-          <div className="absolute inset-0 pointer-events-none z-[650]">
-            <div
-              className="absolute inset-0"
-              style={{
-                backgroundImage: 'repeating-linear-gradient(135deg, rgba(251,191,36,0.10) 0 12px, rgba(251,191,36,0.03) 12px 24px)',
-              }}
-            />
-            <div className="absolute top-3 right-3 px-2.5 py-1.5 rounded border border-amber-400/35 bg-black/70 backdrop-blur-sm">
-              <p className="text-[9px] font-bold uppercase tracking-widest text-amber-300">OPP COORDS UNKNOWN</p>
-              <p className="text-[9px] text-amber-200/80">{unknownOpponentPingCount} unresolved ping{unknownOpponentPingCount === 1 ? '' : 's'}</p>
-            </div>
-          </div>
-        )}
 
         {/* Radar Scanner Overlay */}
         {!interactive && (

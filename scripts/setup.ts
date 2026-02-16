@@ -80,6 +80,7 @@ let wallets: { admin: string; player1: string; player2: string } = { admin: '', 
 let deadDrop = {
   verifierMode: 'mock',
   verifierContractId: '',
+  randomnessVerifierContractId: '',
   pingImageId: '0707070707070707070707070707070707070707070707070707070707070707',
   verifierSelectorHex: '',
   proverUrl: '',
@@ -130,6 +131,11 @@ if (existsSync('deployment.json')) {
   deadDrop = {
     verifierMode: getEnvValue(env, 'DEAD_DROP_VERIFIER_MODE', deadDrop.verifierMode),
     verifierContractId: getEnvValue(env, 'DEAD_DROP_VERIFIER_CONTRACT_ID', getEnvValue(env, 'VITE_DEAD_DROP_VERIFIER_CONTRACT_ID')),
+    randomnessVerifierContractId: getEnvValue(
+      env,
+      'DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID',
+      getEnvValue(env, 'VITE_DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID', deadDrop.randomnessVerifierContractId)
+    ),
     pingImageId: getEnvValue(env, 'DEAD_DROP_PING_IMAGE_ID', getEnvValue(env, 'VITE_DEAD_DROP_PING_IMAGE_ID', deadDrop.pingImageId)),
     verifierSelectorHex: getEnvValue(env, 'DEAD_DROP_VERIFIER_SELECTOR_HEX', getEnvValue(env, 'VITE_DEAD_DROP_VERIFIER_SELECTOR_HEX')),
     proverUrl: getEnvValue(env, 'VITE_DEAD_DROP_PROVER_URL'),
@@ -183,6 +189,7 @@ ${contractEnvLines}
 VITE_DEAD_DROP_PROVER_URL=${deadDrop.proverUrl}
 VITE_DEAD_DROP_RELAYER_URL=${deadDrop.relayerUrl}
 VITE_DEAD_DROP_VERIFIER_CONTRACT_ID=${deadDrop.verifierContractId}
+VITE_DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID=${deadDrop.randomnessVerifierContractId || deadDrop.verifierContractId}
 VITE_DEAD_DROP_PING_IMAGE_ID=${deadDrop.pingImageId}
 VITE_DEAD_DROP_VERIFIER_SELECTOR_HEX=${deadDrop.verifierSelectorHex}
 VITE_WALLET_MODE=${wallet.mode}
@@ -202,6 +209,7 @@ VITE_DEV_PLAYER2_SECRET=${walletSecrets.player2}
 # Dead Drop verifier/prover mode
 DEAD_DROP_VERIFIER_MODE=${deadDrop.verifierMode}
 DEAD_DROP_VERIFIER_CONTRACT_ID=${deadDrop.verifierContractId}
+DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID=${deadDrop.randomnessVerifierContractId || deadDrop.verifierContractId}
 DEAD_DROP_PING_IMAGE_ID=${deadDrop.pingImageId}
 DEAD_DROP_VERIFIER_SELECTOR_HEX=${deadDrop.verifierSelectorHex}
 OZ_RELAYER_API_KEY=${ozRelayerApiKey}

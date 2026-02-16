@@ -1,35 +1,21 @@
+export interface SessionRandomnessArtifacts {
+  sessionId: number;
+  randomnessOutputHex: string;
+  randomnessSignatureHex: string;
+  dropCommitmentHex: string;
+}
+
 export interface ProvePingRequest {
   sessionId: number;
   turn: number;
-  partialDx: number;
-  partialDy: number;
-  responderX: number;
-  responderY: number;
-  responderSaltHex: string;
-  responderCommitmentHex: string;
+  pingX: number;
+  pingY: number;
 }
 
 export interface ProvePingResponse {
   distance: number;
   proofHex: string;
   publicInputsHex: string[];
-}
-
-function isLegacyResponderSchemaError(message: string): boolean {
-  const normalized = message.toLowerCase();
-  return normalized.includes('a_x must be uint32')
-    || normalized.includes('b_x must be uint32')
-    || normalized.includes('commitment_a_hex')
-    || normalized.includes('commitment_b_hex');
-}
-
-function formatLegacySchemaMismatchMessage(proverUrl: string): string {
-  return [
-    `Dead Drop prover API mismatch at ${proverUrl}.`,
-    'Backend appears to use legacy combined-secret fields (a_x/b_x/etc).',
-    'This frontend requires responder-only inputs: responder_x/responder_y plus partial_dx/partial_dy.',
-    'Update and restart backend/dead-drop-prover from this repo, then retry Send Ping.',
-  ].join(' ');
 }
 
 async function readProofServiceError(response: Response): Promise<string> {
@@ -49,6 +35,49 @@ async function readProofServiceError(response: Response): Promise<string> {
   return raw || fallback;
 }
 
+function ensureHex(value: unknown, label: string, expectedBytes?: number): string {
+  if (typeof value !== 'string' || !value) {
+    throw new Error(`Proof service returned missing ${label}`);
+  }
+  const normalized = value.replace(/^0x/, '').toLowerCase();
+  if (!/^[0-9a-f]+$/.test(normalized) || normalized.length % 2 !== 0) {
+    throw new Error(`Proof service returned invalid ${label}`);
+  }
+  if (expectedBytes && normalized.length !== expectedBytes * 2) {
+    throw new Error(`Proof service returned invalid ${label} length`);
+  }
+  return normalized;
+}
+
+export async function getSessionRandomness(
+  proverUrl: string,
+  sessionId: number,
+): Promise<SessionRandomnessArtifacts> {
+  const normalizedProverUrl = proverUrl.replace(/\/$/, '');
+  const response = await fetch(`${normalizedProverUrl}/randomness/session`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await readProofServiceError(response));
+  }
+
+  const data = await response.json();
+  const parsedSessionId = Number(data.session_id);
+  if (!Number.isInteger(parsedSessionId) || parsedSessionId !== sessionId) {
+    throw new Error('Proof service returned unexpected session_id');
+  }
+
+  return {
+    sessionId: parsedSessionId,
+    randomnessOutputHex: ensureHex(data.randomness_output_hex, 'randomness_output_hex', 32),
+    randomnessSignatureHex: ensureHex(data.randomness_signature_hex, 'randomness_signature_hex', 64),
+    dropCommitmentHex: ensureHex(data.drop_commitment_hex, 'drop_commitment_hex', 32),
+  };
+}
+
 export async function provePing(
   proverUrl: string,
   req: ProvePingRequest,
@@ -60,21 +89,13 @@ export async function provePing(
     body: JSON.stringify({
       session_id: req.sessionId,
       turn: req.turn,
-      partial_dx: req.partialDx,
-      partial_dy: req.partialDy,
-      responder_x: req.responderX,
-      responder_y: req.responderY,
-      responder_salt_hex: req.responderSaltHex,
-      responder_commitment_hex: req.responderCommitmentHex,
+      ping_x: req.pingX,
+      ping_y: req.pingY,
     }),
   });
 
   if (!response.ok) {
-    const message = await readProofServiceError(response);
-    if (isLegacyResponderSchemaError(message)) {
-      throw new Error(formatLegacySchemaMismatchMessage(normalizedProverUrl));
-    }
-    throw new Error(message);
+    throw new Error(await readProofServiceError(response));
   }
 
   const data = await response.json();

@@ -33,6 +33,6 @@ const server = createServer();
 server.listen(port, () => {
   console.log(`dead-drop backend listening on http://localhost:${port}`);
   console.log(
-    "Endpoints: GET /, POST /prove/ping, POST /tx/submit, POST /tx/submit-direct, POST /relay/ping/request, GET /relay/ping/next, POST /relay/ping/respond, GET /relay/ping/result, WS /relay/webrtc"
+    "Endpoints: GET /, POST /randomness/session, POST /prove/ping, POST /tx/submit, POST /tx/submit-direct, POST /relay/ping/request, GET /relay/ping/next, POST /relay/ping/respond, GET /relay/ping/result, WS /relay/webrtc"
   );
 });

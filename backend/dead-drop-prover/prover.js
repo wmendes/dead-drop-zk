@@ -1,6 +1,13 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
+let poseidon2Hash;
+try {
+  ({ poseidon2Hash } = require("@zkpassport/poseidon2"));
+} catch {
+  // Reuse frontend-installed dependency in monorepo setups.
+  ({ poseidon2Hash } = require("../../dead-drop-frontend/node_modules/@zkpassport/poseidon2"));
+}
 
 // BN254 scalar field prime — must match deadDropNoirService.ts
 const BN254_FR = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
@@ -37,7 +44,7 @@ async function getInstances() {
   return { noir: _noir, backend: _backend };
 }
 
-// ── Utilities (mirror deadDropNoirService.ts) ──────────────────────────────
+// ── Utilities ───────────────────────────────────────────────────────────────
 
 function hexToBigInt(hex) {
   const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
@@ -54,15 +61,21 @@ function wrappedManhattan(px, py, rx, ry) {
   return Math.min(dx, GRID_SIZE - dx) + Math.min(dy, GRID_SIZE - dy);
 }
 
+function computeDropCommitment(dropX, dropY, dropSaltHex) {
+  const saltBigInt = hexToBigInt(dropSaltHex) % BN254_FR;
+  const result = poseidon2Hash([BigInt(dropX), BigInt(dropY), saltBigInt]);
+  return result.toString(16).padStart(64, "0");
+}
+
 // ── Main export ────────────────────────────────────────────────────────────
 
 /**
  * Generate a Noir UltraHonk proof for a Dead Drop ping.
  *
- * Input fields (responder-only design):
- *   session_id, turn, partial_dx, partial_dy
- *   responder_x, responder_y, responder_salt_hex
- *   responder_commitment_hex (32 bytes hex, no 0x)
+ * Input fields:
+ *   session_id, turn, ping_x, ping_y
+ *   drop_x, drop_y, drop_salt_hex
+ *   drop_commitment_hex (32 bytes hex, no 0x)
  *
  * Returns: { distance, proofHex, publicInputsHex }
  */
@@ -70,41 +83,63 @@ async function provePing(input) {
   const { noir, backend } = await getInstances();
 
   const distance = wrappedManhattan(
-    input.partial_dx,
-    input.partial_dy,
-    input.responder_x,
-    input.responder_y
+    input.ping_x,
+    input.ping_y,
+    input.drop_x,
+    input.drop_y
   );
 
   // Reduce salts mod BN254_FR to get valid field elements.
-  const responderSaltBigInt = hexToBigInt(input.responder_salt_hex) % BN254_FR;
+  const dropSaltBigInt = hexToBigInt(input.drop_salt_hex) % BN254_FR;
 
-  const witnessInput = {
+  const witnessInputNew = {
     // Private inputs
-    responder_x: String(input.responder_x),
-    responder_y: String(input.responder_y),
-    responder_salt: toFieldHex(responderSaltBigInt),
+    drop_x: String(input.drop_x),
+    drop_y: String(input.drop_y),
+    drop_salt: toFieldHex(dropSaltBigInt),
     // Public inputs
     session_id: String(input.session_id),
     turn: String(input.turn),
-    partial_dx: String(input.partial_dx),
-    partial_dy: String(input.partial_dy),
-    expected_commitment: "0x" + input.responder_commitment_hex,
+    ping_x: String(input.ping_x),
+    ping_y: String(input.ping_y),
+    expected_commitment: "0x" + input.drop_commitment_hex,
+    expected_distance: String(distance),
+  };
+
+  // Backward-compatible mapping for older compiled artifacts.
+  const witnessInputLegacy = {
+    // Private inputs
+    responder_x: String(input.drop_x),
+    responder_y: String(input.drop_y),
+    responder_salt: toFieldHex(dropSaltBigInt),
+    // Public inputs
+    session_id: String(input.session_id),
+    turn: String(input.turn),
+    partial_dx: String(input.ping_x),
+    partial_dy: String(input.ping_y),
+    expected_commitment: "0x" + input.drop_commitment_hex,
     expected_distance: String(distance),
   };
 
   console.log(
-    "[prover] Executing witness (session=%d turn=%d partial=(%d,%d) responder=(%d,%d) distance=%d)...",
+    "[prover] Executing witness (session=%d turn=%d ping=(%d,%d) distance=%d)...",
     input.session_id,
     input.turn,
-    input.partial_dx,
-    input.partial_dy,
-    input.responder_x,
-    input.responder_y,
+    input.ping_x,
+    input.ping_y,
     distance
   );
   const t0 = Date.now();
-  const { witness } = await noir.execute(witnessInput);
+  let witness;
+  try {
+    ({ witness } = await noir.execute(witnessInputNew));
+  } catch (newSchemaErr) {
+    try {
+      ({ witness } = await noir.execute(witnessInputLegacy));
+    } catch {
+      throw newSchemaErr;
+    }
+  }
   console.log("[prover] Witness done in %d ms", Date.now() - t0);
 
   console.log("[prover] Generating proof...");
@@ -121,4 +156,4 @@ async function provePing(input) {
   return { distance, proofHex, publicInputsHex };
 }
 
-module.exports = { provePing };
+module.exports = { provePing, computeDropCommitment };
