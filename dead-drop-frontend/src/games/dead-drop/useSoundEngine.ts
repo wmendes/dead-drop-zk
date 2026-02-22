@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import * as Tone from 'tone';
-
-type TemperatureZone = 'FOUND' | 'HOT' | 'WARM' | 'COOL' | 'COLD';
+import { zoneFrequency, zonePingPattern, type TemperatureZone } from './temperatureZones';
 
 export function useSoundEngine() {
   const [enabled, setEnabled] = useState(false);
@@ -64,16 +63,8 @@ export function useSoundEngine() {
   const playPingResult = async (zone: TemperatureZone) => {
     if (!enabled) return;
     await ensureAudioStarted();
-
-    const freqMap: Record<TemperatureZone, number> = {
-      COLD: 180,
-      COOL: 320,
-      WARM: 520,
-      HOT: 800,
-      FOUND: 1200,
-    };
-
-    const freq = freqMap[zone];
+    const freq = zoneFrequency(zone);
+    const pattern = zonePingPattern(zone);
     const synth = new Tone.Synth({
       oscillator: { type: 'sine' },
       envelope: {
@@ -84,7 +75,7 @@ export function useSoundEngine() {
       },
     }).connect(reverbRef.current!);
 
-    if (zone === 'FOUND') {
+    if (pattern === 'found') {
       // Rapid ascending sweep + alarm pulse
       synth.triggerAttackRelease(freq, '8n', Tone.now());
       synth.frequency.setValueAtTime(freq, Tone.now());
@@ -95,10 +86,15 @@ export function useSoundEngine() {
         const time = Tone.now() + i * 0.2;
         synth.triggerAttackRelease('8n', time);
       }
-    } else if (zone === 'HOT') {
-      // 3 rapid repeats for hot
+    } else if (pattern === 'triple') {
+      // Three rapid pulses for the hottest non-terminal zone.
       for (let i = 0; i < 3; i++) {
         const time = Tone.now() + i * 0.15;
+        synth.triggerAttackRelease(freq, '16n', time);
+      }
+    } else if (pattern === 'double') {
+      for (let i = 0; i < 2; i++) {
+        const time = Tone.now() + i * 0.17;
         synth.triggerAttackRelease(freq, '16n', time);
       }
     } else {

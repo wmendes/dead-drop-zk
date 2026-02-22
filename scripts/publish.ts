@@ -279,7 +279,6 @@ const runtimeConfig = {
   deadDropRelayerUrl: env.VITE_DEAD_DROP_RELAYER_URL || '',
   deadDropVerifierContractId: env.VITE_DEAD_DROP_VERIFIER_CONTRACT_ID || '',
   deadDropPingImageId: env.VITE_DEAD_DROP_PING_IMAGE_ID || '',
-  deadDropVerifierSelectorHex: env.VITE_DEAD_DROP_VERIFIER_SELECTOR_HEX || '',
 };
 
 const configText = `window.__STELLAR_GAME_STUDIO_CONFIG__ = ${JSON.stringify(runtimeConfig, null, 2)};\n`;

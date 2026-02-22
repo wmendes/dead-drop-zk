@@ -1,8 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { gridToLatLng, formatLatLng } from '../GameMap';
-
-type TemperatureZone = 'FOUND' | 'HOT' | 'WARM' | 'COOL' | 'COLD';
+import { zoneColorHex, zoneLabel, type TemperatureZone } from '../temperatureZones';
 
 interface PingResult {
     turn: number;
@@ -14,16 +13,6 @@ interface PingResult {
 
 interface PingLogProps {
     history: PingResult[];
-}
-
-function getZoneColor(zone: TemperatureZone): string {
-    switch (zone) {
-        case 'FOUND': return '#4ade80';
-        case 'HOT': return '#ff6b6b';
-        case 'WARM': return '#fbbf24';
-        case 'COOL': return '#22d3ee';
-        case 'COLD': return '#475569';
-    }
 }
 
 export function PingLog({ history }: PingLogProps) {
@@ -51,7 +40,7 @@ export function PingLog({ history }: PingLogProps) {
                 <AnimatePresence initial={false}>
                     {[...history].map((ping, i) => {
                         const pos = gridToLatLng(ping.x, ping.y);
-                        const color = getZoneColor(ping.zone);
+                        const color = zoneColorHex(ping.zone);
                         return (
                             <motion.div
                                 key={`${ping.turn}-${i}`}
@@ -69,7 +58,7 @@ export function PingLog({ history }: PingLogProps) {
                                     <span className="text-terminal-green/90">{formatLatLng(pos.lat, pos.lng)}</span>
                                 </div>
                                 <span className="font-bold flex items-center gap-2" style={{ color }}>
-                                    {ping.zone}
+                                    {zoneLabel(ping.zone)}
                                     <span className="text-terminal-green/30 text-[10px] font-normal">d={ping.distance}</span>
                                 </span>
                             </motion.div>

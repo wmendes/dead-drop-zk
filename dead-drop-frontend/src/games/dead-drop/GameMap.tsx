@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { MapContainer, TileLayer, CircleMarker, useMapEvents, useMap } from 'react-leaflet';
 import type { LeafletMouseEvent } from 'leaflet';
+import { zoneColorHex, type TemperatureZone } from './temperatureZones';
 
 const GRID_SIZE = 100;
 const MAP_CENTER: [number, number] = [20, 0];
@@ -9,8 +10,6 @@ const MAP_MIN_ZOOM = 2;
 const MAP_MAX_ZOOM = 4;
 const MAP_BOUNDS: [[number, number], [number, number]] = [[-85, -180], [85, 180]];
 
-type TemperatureZone = 'FOUND' | 'HOT' | 'WARM' | 'COOL' | 'COLD';
-
 interface PingResult {
   turn: number;
   x: number;
@@ -18,16 +17,6 @@ interface PingResult {
   distance: number;
   zone: TemperatureZone;
   player: string;
-}
-
-function getZoneColor(zone: TemperatureZone): string {
-  switch (zone) {
-    case 'FOUND': return '#4ade80'; // Terminal green
-    case 'HOT': return '#ff6b6b';   // Warning red
-    case 'WARM': return '#fbbf24';  // Amber
-    case 'COOL': return '#22d3ee';  // Cyan terminal
-    case 'COLD': return '#475569';  // Dim gray
-  }
 }
 
 // --- Coordinate conversion ---
@@ -108,7 +97,7 @@ export function GameMap({ pingHistory, selectedCell, onCellSelect, interactive, 
   const pingMarkers = useMemo(() => pingHistory
     .map((ping, i) => {
     const pos = gridToLatLng(ping.x, ping.y);
-    const color = getZoneColor(ping.zone);
+    const color = zoneColorHex(ping.zone);
     const isMe = userAddress ? ping.player === userAddress : true;
     return (
       <CircleMarker

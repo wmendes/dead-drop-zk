@@ -10,6 +10,7 @@ const RELAY_TTL_MS = Number(process.env.DEAD_DROP_RELAY_TTL_MS || 120_000);
 const RELAY_READY_GRACE_MS = Number(
   process.env.DEAD_DROP_RELAY_READY_GRACE_MS || 60_000
 );
+const FIXED_DROP_COORDINATE = parseFixedDropCoordinate(process.env.DEAD_DROP_FIXED_COORDINATE);
 
 function corsHeaders() {
   return {
@@ -73,18 +74,41 @@ function parseU32(value, label) {
   return n;
 }
 
-function parseSelector(value) {
-  if (value === undefined || value === null || value === "") {
-    return "";
-  }
-  return normalizeHex(value, "VERIFIER_SELECTOR_HEX", 4);
-}
 
 function parseAddress(value, label) {
   if (typeof value !== "string" || !value.trim()) {
     throw new Error(`${label} must be a non-empty string`);
   }
   return value.trim();
+}
+
+function parseFixedDropCoordinate(value) {
+  if (value === undefined || value === null) return null;
+
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  const match = raw.match(/^(\d+)\s*,\s*(\d+)$/);
+  if (!match) {
+    throw new Error(
+      `DEAD_DROP_FIXED_COORDINATE must use "x,y" format, got: ${raw}`
+    );
+  }
+
+  const x = Number(match[1]);
+  const y = Number(match[2]);
+  if (!Number.isInteger(x) || !Number.isInteger(y)) {
+    throw new Error(
+      `DEAD_DROP_FIXED_COORDINATE must contain integers, got: ${raw}`
+    );
+  }
+  if (x < 0 || x >= PING_GRID_SIZE || y < 0 || y >= PING_GRID_SIZE) {
+    throw new Error(
+      `DEAD_DROP_FIXED_COORDINATE must be within [0, ${PING_GRID_SIZE - 1}] for both x and y, got: ${raw}`
+    );
+  }
+
+  return { x, y };
 }
 
 function relayKey(sessionId, turn) {
@@ -142,8 +166,12 @@ function computeRandomnessOutputHex(sessionId, dropCommitmentHex, randomnessSign
 }
 
 function createHiddenDropArtifacts(sessionId) {
-  const drop_x = randomBytes(2).readUInt16BE(0) % PING_GRID_SIZE;
-  const drop_y = randomBytes(2).readUInt16BE(0) % PING_GRID_SIZE;
+  const drop_x = FIXED_DROP_COORDINATE
+    ? FIXED_DROP_COORDINATE.x
+    : randomBytes(2).readUInt16BE(0) % PING_GRID_SIZE;
+  const drop_y = FIXED_DROP_COORDINATE
+    ? FIXED_DROP_COORDINATE.y
+    : randomBytes(2).readUInt16BE(0) % PING_GRID_SIZE;
   const drop_salt_hex = randomBytes(32).toString("hex");
   const drop_commitment_hex = computeDropCommitment(drop_x, drop_y, drop_salt_hex);
   const randomness_signature_hex = randomBytes(64).toString("hex");
@@ -169,6 +197,12 @@ function createServer(options = {}) {
   const relayStore = options.relayStore || new Map();
   const webrtcPeersBySession = options.webrtcPeersBySession || new Map();
   const hiddenDropBySession = options.hiddenDropBySession || new Map();
+
+  if (FIXED_DROP_COORDINATE) {
+    console.log(
+      `[dead-drop-prover] DEAD_DROP_FIXED_COORDINATE enabled at (${FIXED_DROP_COORDINATE.x}, ${FIXED_DROP_COORDINATE.y})`
+    );
+  }
 
   function getSessionPeers(sessionId) {
     let peers = webrtcPeersBySession.get(sessionId);
@@ -385,8 +419,8 @@ function createServer(options = {}) {
       if (txResult?.status === "FAILED") {
         const resultMeta = txResult.resultMetaXdr
           ? (typeof txResult.resultMetaXdr === "string"
-              ? txResult.resultMetaXdr
-              : txResult.resultMetaXdr.toXDR("base64"))
+            ? txResult.resultMetaXdr
+            : txResult.resultMetaXdr.toXDR("base64"))
           : "no meta";
         console.error("[submit-direct] tx FAILED resultMeta=%s", resultMeta);
       }

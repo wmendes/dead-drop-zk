@@ -1,11 +1,24 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Buffer } from 'buffer';
-import { Loader2, Crosshair, History, Info, Copy, Check, Volume2, VolumeX } from 'lucide-react';
+import {
+  Loader2,
+  Crosshair,
+  History,
+  Info,
+  Copy,
+  Check,
+  Volume2,
+  VolumeX,
+  ShieldCheck,
+  ChevronDown,
+  ChevronUp,
+  ExternalLink,
+} from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-import { DeadDropService } from './deadDropService';
+import { DeadDropService, type PingEventRecord } from './deadDropService';
 import { useWallet } from '@/hooks/useWallet';
-import { DEAD_DROP_CONTRACT, DEAD_DROP_PROVER_URL } from '@/utils/constants';
+import { DEAD_DROP_CONTRACT, DEAD_DROP_PROVER_URL, NETWORK } from '@/utils/constants';
 import type { Game } from './bindings';
 import { GameStatus } from './bindings';
 import { GameMap, gridToLatLng, formatLatLng } from './GameMap';
@@ -15,12 +28,30 @@ import { ActionButton } from './components/ActionPanel';
 import { DeadDropLogo } from '@/components/DeadDropLogo';
 import { useSoundEngine } from './useSoundEngine';
 import { getSessionRandomness, provePing as provePingViaBackend } from './deadDropProofService';
+import { distanceToZone, zoneLabel, zoneTextClass, type TemperatureZone } from './temperatureZones';
 
 const MAX_TURNS = 30;
 const MODAL_PAGE_SIZE = 4;
 
-type TemperatureZone = 'FOUND' | 'HOT' | 'WARM' | 'COOL' | 'COLD';
 type GamePhase = 'create' | 'waiting_opponent' | 'my_turn' | 'opponent_turn' | 'game_over';
+type ProofStatus = 'verified_onchain' | 'pending' | 'failed';
+type ProofDecodeStatus = 'idle' | 'loading' | 'ready' | 'failed';
+
+interface PingProofView {
+  status: ProofStatus;
+  txHash?: string;
+  proofHashShort?: string;
+  publicInputsHashShort?: string;
+  proofHex?: string;
+  publicInputsHex?: string[];
+  decodeStatus: ProofDecodeStatus;
+  decodeAttempts?: number;
+  decodeNextRetryAtMs?: number;
+  decodeStartedAtMs?: number;
+  decodeError?: string;
+  verifiedAtMs?: number;
+  source: 'local_submission' | 'chain_event';
+}
 
 interface PingResult {
   turn: number;
@@ -29,6 +60,7 @@ interface PingResult {
   distance: number;
   zone: TemperatureZone;
   player: string;
+  proof: PingProofView;
 }
 
 interface DeadDropGameProps {
@@ -49,24 +81,6 @@ const createRandomSessionId = (): number => {
   return buffer[0] || 1;
 };
 
-function getTemperatureZone(distance: number): TemperatureZone {
-  if (distance === 0) return 'FOUND';
-  if (distance <= 5) return 'HOT';
-  if (distance <= 15) return 'WARM';
-  if (distance <= 30) return 'COOL';
-  return 'COLD';
-}
-
-function getZoneColor(zone: TemperatureZone): string {
-  switch (zone) {
-    case 'FOUND': return 'text-emerald-400';
-    case 'HOT': return 'text-red-400';
-    case 'WARM': return 'text-orange-400';
-    case 'COOL': return 'text-cyan-400';
-    case 'COLD': return 'text-blue-400';
-  }
-}
-
 function toErrorMessage(err: unknown, fallback: string): string {
   if (err instanceof Error && err.message) return err.message;
   if (typeof err === 'string' && err) return err;
@@ -77,6 +91,55 @@ function toErrorMessage(err: unknown, fallback: string): string {
     // ignore
   }
   return fallback;
+}
+
+function normalizeHex(value: string): string {
+  return value.replace(/^0x/i, '').toLowerCase();
+}
+
+function shortHash(value: string, size = 8): string {
+  const normalized = normalizeHex(value);
+  if (normalized.length <= size * 2) return normalized;
+  return `${normalized.slice(0, size)}...${normalized.slice(-size)}`;
+}
+
+function previewHex(value: string, size = 12): string {
+  const normalized = normalizeHex(value);
+  if (normalized.length <= size * 2) return normalized;
+  return `${normalized.slice(0, size)}...${normalized.slice(-size)}`;
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const normalized = normalizeHex(hex);
+  if (!normalized) return new Uint8Array();
+  if (normalized.length % 2 !== 0 || /[^0-9a-f]/i.test(normalized)) {
+    throw new Error('Invalid hex input');
+  }
+
+  const out = new Uint8Array(normalized.length / 2);
+  for (let i = 0; i < normalized.length; i += 2) {
+    out[i / 2] = parseInt(normalized.slice(i, i + 2), 16);
+  }
+  return out;
+}
+
+async function sha256Hex(data: Uint8Array): Promise<string> {
+  const copied = new Uint8Array(data.length);
+  copied.set(data);
+  const digest = await crypto.subtle.digest('SHA-256', copied.buffer);
+  const bytes = new Uint8Array(digest);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function digestPublicInputsHex(inputs: string[]): Promise<string> {
+  const flattened = inputs.map(normalizeHex).join('');
+  return sha256Hex(hexToBytes(flattened));
+}
+
+function buildTxExplorerUrl(txHash?: string): string | null {
+  if (!txHash) return null;
+  const networkPath = NETWORK === 'testnet' ? 'testnet' : 'public';
+  return `https://stellar.expert/explorer/${networkPath}/tx/${txHash}`;
 }
 
 export function DeadDropGame({
@@ -105,6 +168,7 @@ export function DeadDropGame({
   const [showInfoModal, setShowInfoModal] = useState(false);
   const [showGameOverModal, setShowGameOverModal] = useState(false);
   const [historyPage, setHistoryPage] = useState(0);
+  const [expandedProofTurn, setExpandedProofTurn] = useState<number | null>(null);
   const [infoPage, setInfoPage] = useState(0);
 
   const [loading, setLoading] = useState(false);
@@ -115,6 +179,8 @@ export function DeadDropGame({
   const actionLock = useRef(false);
   const missingSessionNotified = useRef(false);
   const gamePhaseRef = useRef<GamePhase>('create');
+  const proofHydrationInFlightRef = useRef<Set<string>>(new Set());
+  const unmountedRef = useRef(false);
 
   const showToast = (message: string, type: 'error' | 'success' | 'info', duration?: number) => {
     setToast({ message, type, id: crypto.randomUUID(), duration });
@@ -165,13 +231,7 @@ export function DeadDropGame({
     return 'game_over';
   }, [userAddress]);
 
-  const mergePingEvents = useCallback((events: {
-    player: string;
-    turn: number;
-    distance: number;
-    x: number;
-    y: number;
-  }[]) => {
+  const mergePingEvents = useCallback((events: PingEventRecord[]) => {
     if (!events || events.length === 0) return;
 
     setPingHistory(prev => {
@@ -180,13 +240,34 @@ export function DeadDropGame({
 
       for (const evt of events) {
         const index = next.findIndex((p) => p.turn === evt.turn);
+        const existing = index !== -1 ? next[index] : null;
+        const txHash = existing?.proof?.txHash ?? evt.txHash;
+        const hasProofData = Boolean(existing?.proof?.proofHashShort);
+        const onChainProof: PingProofView = {
+          status: 'verified_onchain',
+          source: existing?.proof?.source === 'local_submission' ? 'local_submission' : 'chain_event',
+          txHash,
+          proofHashShort: existing?.proof?.proofHashShort,
+          publicInputsHashShort: existing?.proof?.publicInputsHashShort,
+          proofHex: existing?.proof?.proofHex,
+          publicInputsHex: existing?.proof?.publicInputsHex,
+          decodeStatus: existing?.proof?.decodeStatus
+            ?? (hasProofData ? 'ready' : txHash ? 'idle' : 'failed'),
+          decodeAttempts: existing?.proof?.decodeAttempts,
+          decodeNextRetryAtMs: existing?.proof?.decodeNextRetryAtMs,
+          decodeStartedAtMs: existing?.proof?.decodeStartedAtMs,
+          decodeError: existing?.proof?.decodeError
+            ?? (!txHash ? 'Transaction hash unavailable for this event.' : undefined),
+          verifiedAtMs: existing?.proof?.verifiedAtMs ?? Date.now(),
+        };
         const entry: PingResult = {
           turn: evt.turn,
           x: evt.x,
           y: evt.y,
           distance: evt.distance,
-          zone: getTemperatureZone(evt.distance),
+          zone: distanceToZone(evt.distance),
           player: evt.player,
+          proof: onChainProof,
         };
 
         if (index !== -1) {
@@ -195,6 +276,8 @@ export function DeadDropGame({
             || next[index].x !== entry.x
             || next[index].y !== entry.y
             || next[index].player !== entry.player
+            || next[index].proof.status !== entry.proof.status
+            || next[index].proof.txHash !== entry.proof.txHash
           ) {
             next[index] = entry;
             changed = true;
@@ -212,6 +295,7 @@ export function DeadDropGame({
   const resetMissingSessionState = useCallback(() => {
     setGameState(null);
     setPingHistory([]);
+    setExpandedProofTurn(null);
     setSelectedCell(null);
     setStatusMessage(null);
     setLoading(false);
@@ -277,6 +361,13 @@ export function DeadDropGame({
   }, [gamePhase]);
 
   useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (gamePhase === 'create') return;
     void syncFromChain('phase-change');
 
@@ -305,6 +396,7 @@ export function DeadDropGame({
     setSessionId(createRandomSessionId());
     setGameState(null);
     setPingHistory([]);
+    setExpandedProofTurn(null);
     setSelectedCell(null);
     setLoading(false);
     setJoinRoomCode('');
@@ -429,7 +521,7 @@ export function DeadDropGame({
           sessionPhase: 'gameplay',
           sessionId,
         });
-        await deadDropService.submitPing(
+        const submitResult = await deadDropService.submitPing(
           sessionId,
           userAddress,
           submittedTurn,
@@ -441,26 +533,59 @@ export function DeadDropGame({
           signer,
         );
 
-        const zone = getTemperatureZone(proof.distance);
+        const zone = distanceToZone(proof.distance);
+        const proofHashShort = shortHash(proof.proofHex);
+        const publicInputsHashShort = shortHash(await digestPublicInputsHex(proof.publicInputsHex));
+        const verifiedAtMs = Date.now();
         sound.playPingResult(zone);
 
         setPingHistory((prev) => {
-          if (prev.some((p) => p.turn === submittedTurn)) return prev;
-          return [
-            ...prev,
-            {
-              turn: submittedTurn,
-              x: selectedCell.x,
-              y: selectedCell.y,
-              distance: proof.distance,
-              zone,
-              player: userAddress,
+          const next = [...prev];
+          const existingIndex = next.findIndex((p) => p.turn === submittedTurn);
+          const entry: PingResult = {
+            turn: submittedTurn,
+            x: selectedCell.x,
+            y: selectedCell.y,
+            distance: proof.distance,
+            zone,
+            player: userAddress,
+            proof: {
+              status: 'verified_onchain',
+              source: 'local_submission',
+              txHash: submitResult.txHash,
+              proofHashShort,
+              publicInputsHashShort,
+              proofHex: normalizeHex(proof.proofHex),
+              publicInputsHex: proof.publicInputsHex.map(normalizeHex),
+              decodeStatus: 'ready',
+              decodeAttempts: 0,
+              decodeStartedAtMs: undefined,
+              decodeNextRetryAtMs: undefined,
+              verifiedAtMs,
             },
-          ].sort((a, b) => a.turn - b.turn);
+          };
+
+          if (existingIndex === -1) {
+            next.push(entry);
+          } else {
+            const existing = next[existingIndex];
+            next[existingIndex] = {
+              ...existing,
+              ...entry,
+              proof: {
+                ...existing.proof,
+                ...entry.proof,
+                status: 'verified_onchain',
+                source: 'local_submission',
+              },
+            };
+          }
+
+          return next.sort((a, b) => a.turn - b.turn);
         });
 
         setSelectedCell(null);
-        showToast(proof.distance === 0 ? 'DROP FOUND!' : `${zone} (${proof.distance}m)`, 'info', 2500);
+        showToast(proof.distance === 0 ? 'DROP FOUND!' : `${zoneLabel(zone)} (${proof.distance}m)`, 'info', 2500);
 
         const updatedGame = await deadDropService.getGame(sessionId);
         setGameState(updatedGame);
@@ -517,6 +642,7 @@ export function DeadDropGame({
     setSessionId(createRandomSessionId());
     setGameState(null);
     setPingHistory([]);
+    setExpandedProofTurn(null);
     setSelectedCell(null);
     setLoading(false);
     setJoinRoomCode('');
@@ -537,6 +663,167 @@ export function DeadDropGame({
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const copyProofValue = async (label: string, value: string) => {
+    await navigator.clipboard.writeText(value);
+    showToast(`${label} copied`, 'info', 1000);
+  };
+
+  useEffect(() => {
+    const now = Date.now();
+    const txHashesToHydrate = Array.from(
+      new Set(
+        pingHistory
+          .map((ping) => ping.proof)
+          .filter((proof) =>
+            Boolean(proof.txHash)
+            && !proof.proofHashShort
+            && proof.decodeStatus !== 'loading'
+            && proof.decodeStatus !== 'ready'
+            && (proof.decodeNextRetryAtMs ?? 0) <= now
+          )
+          .map((proof) => proof.txHash as string)
+      )
+    );
+    if (txHashesToHydrate.length === 0) return;
+
+    for (const txHash of txHashesToHydrate) {
+      if (proofHydrationInFlightRef.current.has(txHash)) continue;
+      proofHydrationInFlightRef.current.add(txHash);
+
+      setPingHistory((prev) => {
+        let changed = false;
+        const startedAtMs = Date.now();
+        const next: PingResult[] = prev.map((ping): PingResult => {
+          if (ping.proof.txHash !== txHash) return ping;
+          if (ping.proof.decodeStatus === 'loading' || ping.proof.decodeStatus === 'ready' || ping.proof.decodeStatus === 'failed') {
+            return ping;
+          }
+          changed = true;
+          return {
+            ...ping,
+            proof: {
+            ...ping.proof,
+            decodeStatus: 'loading' as ProofDecodeStatus,
+            decodeStartedAtMs: startedAtMs,
+            decodeNextRetryAtMs: undefined,
+            decodeError: undefined,
+          },
+        };
+      });
+        return changed ? next : prev;
+      });
+
+      void (async () => {
+        try {
+          const decoded = await deadDropService.getSubmitPingProofFromTx(txHash);
+          if (unmountedRef.current) return;
+
+          if (!decoded) {
+            setPingHistory((prev) => {
+              let changed = false;
+              const nowMs = Date.now();
+              const next: PingResult[] = prev.map((ping): PingResult => {
+                if (ping.proof.txHash !== txHash) return ping;
+                if (ping.proof.proofHashShort) return ping;
+                const attempts = (ping.proof.decodeAttempts ?? 0) + 1;
+                const maxAttempts = 4;
+                const shouldFail = attempts >= maxAttempts;
+                changed = true;
+                return {
+                  ...ping,
+                  proof: {
+                    ...ping.proof,
+                    decodeStatus: shouldFail ? 'failed' as ProofDecodeStatus : 'idle' as ProofDecodeStatus,
+                    decodeAttempts: attempts,
+                    decodeStartedAtMs: undefined,
+                    decodeNextRetryAtMs: shouldFail ? undefined : nowMs + Math.min(15_000, 2_000 * attempts),
+                    decodeError: shouldFail
+                      ? 'Proof artifacts could not be decoded from this transaction.'
+                      : 'Transaction is not indexed yet. Retrying shortly.',
+                  },
+                };
+              });
+              return changed ? next : prev;
+            });
+            return;
+          }
+
+          const proofHex = normalizeHex(decoded.proofHex);
+          const publicInputsHex = decoded.publicInputsHex.map(normalizeHex);
+          const proofHashShort = shortHash(proofHex);
+          const publicInputsHashShort = shortHash(await digestPublicInputsHex(publicInputsHex));
+          if (unmountedRef.current) return;
+
+          setPingHistory((prev) => {
+            let changed = false;
+            const next: PingResult[] = prev.map((ping): PingResult => {
+              if (ping.proof.txHash !== txHash) return ping;
+              if (ping.proof.proofHashShort && ping.proof.publicInputsHashShort) return ping;
+              changed = true;
+              return {
+                ...ping,
+                proof: {
+                  ...ping.proof,
+                proofHex,
+                publicInputsHex,
+                proofHashShort,
+                publicInputsHashShort,
+                decodeStatus: 'ready' as ProofDecodeStatus,
+                decodeAttempts: ping.proof.decodeAttempts ?? 0,
+                decodeStartedAtMs: undefined,
+                decodeNextRetryAtMs: undefined,
+                decodeError: undefined,
+              },
+            };
+            });
+            return changed ? next : prev;
+          });
+        } finally {
+          proofHydrationInFlightRef.current.delete(txHash);
+        }
+      })();
+    }
+  }, [pingHistory]);
+
+  useEffect(() => {
+    const LOADING_TIMEOUT_MS = 20_000;
+    const interval = setInterval(() => {
+      const now = Date.now();
+      setPingHistory((prev) => {
+        let changed = false;
+        const next: PingResult[] = prev.map((ping): PingResult => {
+          if (ping.proof.decodeStatus !== 'loading') return ping;
+          const startedAtMs = ping.proof.decodeStartedAtMs;
+          if (!startedAtMs) {
+            changed = true;
+            return {
+              ...ping,
+              proof: {
+                ...ping.proof,
+                decodeStartedAtMs: now,
+              },
+            };
+          }
+          if (now - startedAtMs <= LOADING_TIMEOUT_MS) return ping;
+          changed = true;
+          return {
+            ...ping,
+            proof: {
+              ...ping.proof,
+              decodeStatus: 'failed',
+              decodeStartedAtMs: undefined,
+              decodeNextRetryAtMs: undefined,
+              decodeError: 'Timed out loading proof artifacts from transaction.',
+            },
+          };
+        });
+        return changed ? next : prev;
+      });
+    }, 2_000);
+
+    return () => clearInterval(interval);
+  }, []);
+
   const historyEntries = useMemo(() => [...pingHistory].reverse(), [pingHistory]);
   const historyTotalPages = Math.max(1, Math.ceil(historyEntries.length / MODAL_PAGE_SIZE));
   const historyWindowStart = historyPage * MODAL_PAGE_SIZE;
@@ -548,8 +835,11 @@ export function DeadDropGame({
   }, [historyTotalPages]);
 
   useEffect(() => {
-    if (!showHistoryModal) return;
-    setHistoryPage(0);
+    if (showHistoryModal) {
+      setHistoryPage(0);
+      return;
+    }
+    setExpandedProofTurn(null);
   }, [showHistoryModal]);
 
   useEffect(() => {
@@ -824,32 +1114,201 @@ export function DeadDropGame({
           ) : (
             <>
               <div className="px-1 pb-2">
-                <p className="text-[10px] text-amber-300/80 uppercase tracking-wide">
-                  Ping coordinates are public. Fairness comes from proof-verified distance checks.
+                <p className="text-[10px] text-emerald-300/80 uppercase tracking-wide">
+                  Each ping is accepted only after on-chain ZK proof verification.
+                </p>
+                <p className="text-[10px] text-amber-300/70 uppercase tracking-wide mt-1">
+                  Ping coordinates are public; the hidden drop location remains private.
                 </p>
               </div>
               <div className="flex-1 min-h-0 overflow-y-auto spy-scrollbar pr-1 grid gap-2 content-start">
                 {visibleHistoryEntries.map((ping, i) => {
                   const isMe = ping.player === userAddress;
+                  const isExpanded = expandedProofTurn === ping.turn;
+                  const proofFingerprint = ping.proof.proofHashShort;
+                  const publicInputsHash = ping.proof.publicInputsHashShort;
+                  const proofHex = ping.proof.proofHex;
+                  const publicInputsHex = ping.proof.publicInputsHex;
+                  const proofDecodeStatus = ping.proof.decodeStatus;
+                  const txHash = ping.proof.txHash;
+                  const txExplorerUrl = buildTxExplorerUrl(ping.proof.txHash);
+                  const proofStatusLabel = ping.proof.status === 'verified_onchain'
+                    ? 'ZK Verified'
+                    : ping.proof.status === 'pending'
+                      ? 'Proof Pending'
+                      : 'Proof Failed';
                   return (
-                    <div key={`${ping.turn}-${i}`} className={`flex items-center justify-between p-3 border rounded-lg ${isMe ? 'bg-emerald-500/5 border-emerald-500/15' : 'bg-amber-500/5 border-amber-500/15'}`}>
-                      <div className="flex flex-col gap-0.5">
-                        <div className="flex items-center gap-2">
-                          <span className="text-[10px] text-slate-500 uppercase tracking-wide font-bold">Turn {ping.turn}</span>
-                          <span className={`text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded ${isMe ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
-                            {isMe ? 'You' : 'Opp'}
+                    <div key={`${ping.turn}-${i}`} className={`p-3 border rounded-lg ${isMe ? 'bg-emerald-500/5 border-emerald-500/15' : 'bg-amber-500/5 border-amber-500/15'}`}>
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex flex-col gap-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-[10px] text-slate-500 uppercase tracking-wide font-bold">Turn {ping.turn}</span>
+                            <span className={`text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded ${isMe ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
+                              {isMe ? 'You' : 'Opp'}
+                            </span>
+                            <span className={`inline-flex items-center gap-1 text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border ${
+                              ping.proof.status === 'verified_onchain'
+                                ? 'bg-emerald-500/20 text-emerald-300 border-emerald-400/30'
+                                : ping.proof.status === 'pending'
+                                  ? 'bg-amber-500/20 text-amber-300 border-amber-400/30'
+                                  : 'bg-rose-500/20 text-rose-300 border-rose-400/30'
+                            }`}>
+                              <ShieldCheck className="w-3 h-3" />
+                              {proofStatusLabel}
+                            </span>
+                          </div>
+                          <span className="font-mono text-xs text-slate-300">
+                            {formatLatLng(gridToLatLng(ping.x, ping.y).lat, gridToLatLng(ping.x, ping.y).lng)}
                           </span>
                         </div>
-                        <span className="font-mono text-xs text-slate-300">
-                          {formatLatLng(gridToLatLng(ping.x, ping.y).lat, gridToLatLng(ping.x, ping.y).lng)}
-                        </span>
+                        <div className="text-right">
+                          <span className={`block text-xs font-bold uppercase tracking-wider mb-0.5 ${zoneTextClass(ping.zone)} drop-shadow-sm`}>
+                            {zoneLabel(ping.zone)}
+                          </span>
+                          <span className="text-[10px] text-slate-500 font-mono">{ping.distance}m</span>
+                        </div>
                       </div>
-                      <div className="text-right">
-                        <span className={`block text-xs font-bold uppercase tracking-wider mb-0.5 ${getZoneColor(ping.zone)} drop-shadow-sm`}>
-                          {ping.zone}
-                        </span>
-                        <span className="text-[10px] text-slate-500 font-mono">{ping.distance}m</span>
+                      <div className="mt-2 flex justify-end">
+                        <button
+                          className="inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-slate-400 hover:text-emerald-300 transition-colors"
+                          onClick={() => setExpandedProofTurn((prev) => (prev === ping.turn ? null : ping.turn))}
+                        >
+                          {isExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                          Details
+                        </button>
                       </div>
+
+                      <AnimatePresence initial={false}>
+                        {isExpanded && (
+                          <motion.div
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ opacity: 1, height: 'auto' }}
+                            exit={{ opacity: 0, height: 0 }}
+                            className="mt-2 rounded border border-slate-700/70 bg-slate-900/60 p-2.5 space-y-2 overflow-hidden"
+                          >
+                            <p className="text-[10px] text-slate-300 leading-relaxed">
+                              Verified statement: the reported distance for this ping is consistent with the committed hidden drop, without revealing the drop coordinates.
+                            </p>
+                            {proofDecodeStatus === 'loading' && (
+                              <p className="text-[10px] text-cyan-300/90 uppercase tracking-wide">
+                                Loading proof artifacts from transaction...
+                              </p>
+                            )}
+                            {proofDecodeStatus === 'failed' && (
+                              <p className="text-[10px] text-amber-300/90">
+                                {ping.proof.decodeError || 'Proof artifacts could not be decoded from this transaction.'}
+                              </p>
+                            )}
+
+                            <div className="grid gap-1.5 text-[10px]">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-slate-500 uppercase tracking-wide">Proof fingerprint</span>
+                                <div className="inline-flex items-center gap-1 text-slate-300 font-mono">
+                                  <span>{proofFingerprint ?? 'Unavailable'}</span>
+                                  {proofFingerprint && (
+                                    <button
+                                      className="text-slate-400 hover:text-emerald-300 transition-colors"
+                                      onClick={() => copyProofValue('Proof fingerprint', proofFingerprint)}
+                                      title="Copy proof fingerprint"
+                                    >
+                                      <Copy className="w-3 h-3" />
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-slate-500 uppercase tracking-wide">Public inputs hash</span>
+                                <div className="inline-flex items-center gap-1 text-slate-300 font-mono">
+                                  <span>{publicInputsHash ?? 'Unavailable'}</span>
+                                  {publicInputsHash && (
+                                    <button
+                                      className="text-slate-400 hover:text-emerald-300 transition-colors"
+                                      onClick={() => copyProofValue('Public inputs hash', publicInputsHash)}
+                                      title="Copy public inputs hash"
+                                    >
+                                      <Copy className="w-3 h-3" />
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-slate-500 uppercase tracking-wide">Transaction</span>
+                                <div className="inline-flex items-center gap-1 text-slate-300 font-mono">
+                                  <span>{txHash ? shortHash(txHash) : 'Unavailable'}</span>
+                                  {txHash && (
+                                    <>
+                                      <button
+                                        className="text-slate-400 hover:text-emerald-300 transition-colors"
+                                        onClick={() => copyProofValue('Transaction hash', txHash)}
+                                        title="Copy transaction hash"
+                                      >
+                                        <Copy className="w-3 h-3" />
+                                      </button>
+                                      {txExplorerUrl && (
+                                        <a
+                                          className="text-slate-400 hover:text-emerald-300 transition-colors"
+                                          href={txExplorerUrl}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          title="Open transaction in explorer"
+                                        >
+                                          <ExternalLink className="w-3 h-3" />
+                                        </a>
+                                      )}
+                                    </>
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="pt-1.5 mt-1.5 border-t border-slate-700/60 space-y-1.5">
+                                <span className="block text-slate-500 uppercase tracking-wide">Raw proof data</span>
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="text-slate-500">Proof (hex)</span>
+                                  <div className="inline-flex items-center gap-1 text-slate-300 font-mono">
+                                    <span>{proofHex ? previewHex(proofHex) : 'Unavailable'}</span>
+                                    {proofHex && (
+                                      <button
+                                        className="text-slate-400 hover:text-emerald-300 transition-colors"
+                                        onClick={() => copyProofValue('Proof hex', proofHex)}
+                                        title="Copy proof hex"
+                                      >
+                                        <Copy className="w-3 h-3" />
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+
+                                <div className="space-y-1">
+                                  <span className="block text-slate-500">Public inputs (hex)</span>
+                                  {publicInputsHex && publicInputsHex.length > 0 ? (
+                                    <div className="space-y-1">
+                                      {publicInputsHex.map((inputHex, inputIndex) => (
+                                        <div key={`${ping.turn}-input-${inputIndex}`} className="flex items-center justify-between gap-2">
+                                          <span className="text-slate-400 font-mono">#{inputIndex}</span>
+                                          <div className="inline-flex items-center gap-1 text-slate-300 font-mono">
+                                            <span>{previewHex(inputHex)}</span>
+                                            <button
+                                              className="text-slate-400 hover:text-emerald-300 transition-colors"
+                                              onClick={() => copyProofValue(`Public input #${inputIndex}`, inputHex)}
+                                              title={`Copy public input #${inputIndex}`}
+                                            >
+                                              <Copy className="w-3 h-3" />
+                                            </button>
+                                          </div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <span className="text-slate-300 font-mono">Unavailable</span>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
                     </div>
                   );
                 })}

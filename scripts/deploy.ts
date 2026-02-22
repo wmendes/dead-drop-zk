@@ -191,11 +191,6 @@ const deadDropRandomnessVerifierContractId = getEnvValue(
   'DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID',
   getEnvValue(existingEnv, 'VITE_DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID')
 );
-const deadDropVerifierSelectorHex = getEnvValue(
-  existingEnv,
-  'DEAD_DROP_VERIFIER_SELECTOR_HEX',
-  getEnvValue(existingEnv, 'VITE_DEAD_DROP_VERIFIER_SELECTOR_HEX')
-);
 const deadDropProverUrl = getEnvValue(
   existingEnv,
   'VITE_DEAD_DROP_PROVER_URL',
@@ -206,6 +201,7 @@ const deadDropRelayerUrl = getEnvValue(
   'VITE_DEAD_DROP_RELAYER_URL',
   existingDeployment?.deadDrop?.relayerUrl || ""
 );
+const deadDropFixedCoordinate = getEnvValue(existingEnv, 'DEAD_DROP_FIXED_COORDINATE', '');
 const ozRelayerApiKey = getEnvValue(existingEnv, 'OZ_RELAYER_API_KEY');
 const ozRelayerBaseUrl = getEnvValue(
   existingEnv,
@@ -271,7 +267,7 @@ try {
 for (const identity of ['player1', 'player2']) {
   console.log(`Setting up ${identity}...`);
 
-  let keypair: Keypair;
+  let keypair: StellarKeypair;
   if (existingSecrets[identity]) {
     console.log(`✅ Using existing ${identity} from .env`);
     keypair = Keypair.fromSecret(existingSecrets[identity]!);
@@ -459,7 +455,6 @@ const deploymentInfo = {
         ? deadDropVerifierContractId
         : (mockVerifierId || existingContractIds["mock-verifier"] || "")
     ),
-    verifierSelectorHex: deadDropVerifierSelectorHex,
     proverUrl: deadDropProverUrl,
     relayerUrl: deadDropRelayerUrl,
   },
@@ -489,8 +484,6 @@ ${contractEnvLines}
 VITE_DEAD_DROP_PROVER_URL=${deadDropProverUrl}
 VITE_DEAD_DROP_RELAYER_URL=${deadDropRelayerUrl}
 VITE_DEAD_DROP_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.verifierContractId}
-VITE_DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.randomnessVerifierContractId}
-VITE_DEAD_DROP_VERIFIER_SELECTOR_HEX=${deadDropVerifierSelectorHex}
 VITE_WALLET_MODE=${walletMode}
 VITE_SMART_ACCOUNT_WASM_HASH=${smartAccountWasmHash}
 VITE_SMART_ACCOUNT_WEBAUTHN_VERIFIER_ADDRESS=${smartAccountWebauthnVerifierAddress}
@@ -507,9 +500,8 @@ VITE_DEV_PLAYER2_SECRET=${walletSecrets.player2}
 
 # Dead Drop verifier/prover mode
 DEAD_DROP_VERIFIER_MODE=${deadDropVerifierMode}
-DEAD_DROP_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.verifierContractId}
-DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.randomnessVerifierContractId}
-DEAD_DROP_VERIFIER_SELECTOR_HEX=${deadDropVerifierSelectorHex}
+# Optional local debug override: fixed hidden drop coordinate as "x,y" (0-99)
+DEAD_DROP_FIXED_COORDINATE=${deadDropFixedCoordinate}
 OZ_RELAYER_API_KEY=${ozRelayerApiKey}
 OZ_RELAYER_BASE_URL=${ozRelayerBaseUrl}
 `;

@@ -34,10 +34,30 @@ export interface DeadDropRandomnessArtifacts {
   randomnessSignature: Buffer;
 }
 
+export interface SubmitPingResult {
+  result: unknown;
+  txHash?: string;
+}
+
+export interface SubmitPingProofArtifacts {
+  proofHex: string;
+  publicInputsHex: string[];
+}
+
+export interface PingEventRecord {
+  player: string;
+  turn: number;
+  distance: number;
+  x: number;
+  y: number;
+  txHash?: string;
+}
+
 export class DeadDropService {
   private baseClient: DeadDropClient;
   private contractId: string;
   private pingEventsCursorBySession = new Map<number, number>();
+  private submitPingProofCache = new Map<string, SubmitPingProofArtifacts>();
   private readonly initialPingEventsBackfill = 240;
   private readonly pingEventsRewind = 2;
 
@@ -557,7 +577,7 @@ export class DeadDropService {
     proof: Buffer,
     publicInputs: Buffer[],
     signer: MutationSigner
-  ) {
+  ): Promise<SubmitPingResult> {
     const client = this.createSigningClient(playerAddress, this.toClientSigner(signer));
     const tx = await client.submit_ping({
       session_id: sessionId,
@@ -581,7 +601,11 @@ export class DeadDropService {
       if (sentTx.getTransactionResponse?.status === 'FAILED') {
         throw new Error('Transaction failed');
       }
-      return sentTx.result;
+      const txHash = (sentTx as any)?.getTransactionResponse?.hash as string | undefined;
+      return {
+        result: sentTx.result,
+        txHash,
+      };
     } catch (err) {
       if (err instanceof Error && err.message.includes('Error(Contract, #8)')) {
         throw new Error(
@@ -596,9 +620,132 @@ export class DeadDropService {
     }
   }
 
-  async getPingEvents(sessionId: number): Promise<{
-    player: string, turn: number, distance: number, x: number, y: number,
-  }[]> {
+  private extractOperationsFromEnvelope(envelope: xdr.TransactionEnvelope): xdr.Operation[] {
+    const envelopeType = envelope.switch().name;
+    if (envelopeType === 'envelopeTypeTx') {
+      return envelope.v1().tx().operations();
+    }
+    if (envelopeType === 'envelopeTypeTxV0') {
+      return envelope.v0().tx().operations();
+    }
+    if (envelopeType === 'envelopeTypeTxFeeBump') {
+      const inner = envelope.feeBump().tx().innerTx();
+      const innerAny = inner as any;
+      const innerType = inner.switch().name;
+      if (innerType === 'envelopeTypeTx' && typeof innerAny.v1 === 'function') {
+        return innerAny.v1().tx().operations();
+      }
+      if (innerType === 'envelopeTypeTxV0' && typeof innerAny.v0 === 'function') {
+        return innerAny.v0().tx().operations();
+      }
+      if (typeof innerAny.v1 === 'function') {
+        return innerAny.v1().tx().operations();
+      }
+      return [];
+    }
+    return [];
+  }
+
+  private decodeSubmitPingProofFromEnvelope(
+    envelope: xdr.TransactionEnvelope
+  ): SubmitPingProofArtifacts | null {
+    const operations = this.extractOperationsFromEnvelope(envelope);
+    for (const operation of operations) {
+      const body = operation.body();
+      if (body.switch().name !== 'invokeHostFunction') continue;
+
+      const invokeHostFn = body.invokeHostFunctionOp();
+      const hostFunction = invokeHostFn.hostFunction();
+      if (hostFunction.switch().name !== 'hostFunctionTypeInvokeContract') continue;
+
+      const invokeContract = hostFunction.invokeContract();
+      const fnNameRaw = invokeContract.functionName();
+      const functionName = typeof fnNameRaw === 'string'
+        ? fnNameRaw
+        : Buffer.from(fnNameRaw).toString('utf-8');
+      if (functionName !== 'submit_ping') continue;
+
+      const args = invokeContract.args();
+      if (args.length < 8) return null;
+
+      const proofArg = args[6];
+      const publicInputsArg = args[7];
+      if (proofArg.switch().name !== 'scvBytes') return null;
+      if (publicInputsArg.switch().name !== 'scvVec') return null;
+
+      const publicInputs = publicInputsArg.vec();
+      if (!publicInputs) return null;
+
+      const proofHex = proofArg.bytes().toString('hex');
+      const publicInputsHex: string[] = [];
+      for (const input of publicInputs) {
+        if (input.switch().name !== 'scvBytes') return null;
+        publicInputsHex.push(input.bytes().toString('hex'));
+      }
+
+      return { proofHex, publicInputsHex };
+    }
+
+    return null;
+  }
+
+  private normalizeTxHash(txHash: string): string {
+    return txHash.trim().replace(/^0x/i, '').toLowerCase();
+  }
+
+  async getSubmitPingProofFromTx(txHash: string): Promise<SubmitPingProofArtifacts | null> {
+    const normalizedHash = this.normalizeTxHash(txHash);
+    if (!/^[0-9a-f]{64}$/.test(normalizedHash)) {
+      console.warn('getSubmitPingProofFromTx: invalid transaction hash:', txHash);
+      return null;
+    }
+
+    if (this.submitPingProofCache.has(normalizedHash)) {
+      return this.submitPingProofCache.get(normalizedHash) ?? null;
+    }
+
+    try {
+      const server = new rpc.Server(RPC_URL);
+      const maxAttempts = 4;
+      const waitMs = (attempt: number) => 800 * (attempt + 1);
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      let txInfo: any = null;
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        txInfo = await server.getTransaction(normalizedHash);
+        const status = String(txInfo?.status || '');
+        if (status === 'SUCCESS') break;
+        if (status === 'NOT_FOUND' && attempt < maxAttempts - 1) {
+          await sleep(waitMs(attempt));
+          continue;
+        }
+        return null;
+      }
+
+      if (String(txInfo?.status || '') !== 'SUCCESS') {
+        return null;
+      }
+
+      const envelopeXdr = txInfo?.envelopeXdr;
+      if (!envelopeXdr) {
+        return null;
+      }
+
+      const envelope = typeof envelopeXdr === 'string'
+        ? xdr.TransactionEnvelope.fromXDR(envelopeXdr, 'base64')
+        : envelopeXdr;
+      const decoded = this.decodeSubmitPingProofFromEnvelope(envelope);
+      if (decoded) {
+        this.submitPingProofCache.set(normalizedHash, decoded);
+      }
+      return decoded;
+    } catch (err) {
+      console.warn('getSubmitPingProofFromTx decode failed:', err);
+      return null;
+    }
+  }
+
+  async getPingEvents(sessionId: number): Promise<PingEventRecord[]> {
     try {
       const server = new rpc.Server(RPC_URL);
       const latest = await server.getLatestLedger();
@@ -632,37 +779,37 @@ export class DeadDropService {
       const expectedSymbol = xdr.ScVal.scvSymbol("ping").toXDR('base64');
       const expectedSessionId = xdr.ScVal.scvU32(sessionId).toXDR('base64');
 
-      return events.events
-        .filter(event => {
-          try {
-            const t = event.topic;
-            if (!t || t.length < 2) return false;
-            // topic[0] must be Symbol("ping"), topic[1] must be our session_id
-            return t[0].toXDR('base64') === expectedSymbol
-              && t[1].toXDR('base64') === expectedSessionId;
-          } catch { return false; }
-        })
-        .map(event => {
-          try {
-            // event.value is already xdr.ScVal (not a base64 wrapper)
-            const val = event.value;
-            if (val.switch().name !== 'scvVec') return null;
-            const vec = val.vec();
-            if (!vec || vec.length < 5) return null;
-
-            const player = Address.fromScVal(vec[0]).toString();
-            const turn = vec[1].u32();
-            const distance = vec[2].u32();
-            const x = vec[3].u32();
-            const y = vec[4].u32();
-
-            return { player, turn, distance, x, y };
-          } catch (e) {
-            console.error('Failed to parse ping event', e);
-            return null;
+      const parsed: PingEventRecord[] = [];
+      for (const event of events.events) {
+        try {
+          const t = event.topic;
+          if (!t || t.length < 2) continue;
+          if (t[0].toXDR('base64') !== expectedSymbol || t[1].toXDR('base64') !== expectedSessionId) {
+            continue;
           }
-        })
-        .filter((e): e is { player: string, turn: number, distance: number, x: number, y: number } => e !== null);
+
+          // event.value is already xdr.ScVal (not a base64 wrapper)
+          const val = event.value;
+          if (val.switch().name !== 'scvVec') continue;
+          const vec = val.vec();
+          if (!vec || vec.length < 5) continue;
+
+          const player = Address.fromScVal(vec[0]).toString();
+          const turn = vec[1].u32();
+          const distance = vec[2].u32();
+          const x = vec[3].u32();
+          const y = vec[4].u32();
+
+          const txHashRaw = (event as any).txHash;
+          const txHash = typeof txHashRaw === 'string' && txHashRaw ? txHashRaw : undefined;
+
+          parsed.push({ player, turn, distance, x, y, txHash });
+        } catch (e) {
+          console.error('Failed to parse ping event', e);
+        }
+      }
+
+      return parsed;
     } catch (err) {
       console.error('getPingEvents error:', err);
       return [];

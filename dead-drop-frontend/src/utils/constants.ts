@@ -86,10 +86,6 @@ export const DEAD_DROP_PING_IMAGE_ID =
   runtimeConfig?.deadDropPingImageId ||
   import.meta.env.VITE_DEAD_DROP_PING_IMAGE_ID ||
   '';
-export const DEAD_DROP_VERIFIER_SELECTOR_HEX =
-  runtimeConfig?.deadDropVerifierSelectorHex ||
-  import.meta.env.VITE_DEAD_DROP_VERIFIER_SELECTOR_HEX ||
-  '';
 export const SMART_ACCOUNT_WASM_HASH =
   runtimeConfig?.smartAccountWasmHash ||
   import.meta.env.VITE_SMART_ACCOUNT_WASM_HASH ||
