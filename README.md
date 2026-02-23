@@ -1,166 +1,308 @@
-# ☢️ DEAD DROP: Trustless Pathfinding on Stellar
+# Dead Drop: ZK-Powered Hidden-Information Hunt on Stellar
 
-> **Two agents. Two secrets. One hidden drop.**
->
-> *Built for the "ZK Gaming on Stellar" Hackathon 2026*
+Built for the **ZK Gaming on Stellar** hackathon (2026): a 1v1 game where Zero-Knowledge proofs are required to reveal distances to a hidden target without revealing the target itself.
 
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Stellar: Soroban](https://img.shields.io/badge/Stellar-Protocol%2025-purple)
-![ZK: Noir + UltraHonk](https://img.shields.io/badge/ZK-Noir%20%2B%20UltraHonk-black)
+## Hackathon Fit (Judge Checklist)
 
-## 🕵️‍♂️ The Mission
+- **ZK-powered mechanic**: Each ping reveals only a distance, backed by a ZK proof that the distance is correct.
+- **Deployed onchain component (Stellar Testnet)**: Dead Drop Soroban contract + verifier contracts + Game Hub integration.
+- **Game Hub requirement**: The contract calls `start_game()` and `end_game()` (required by hackathon rules).
+- **Frontend**: Playable React web UI for lobby, join, ping submission, and turn progression.
+- **Open-source repo**: This repository contains contracts, frontend, backend prover/relayer, and scripts.
+- **Video demo**: Add final 2–3 minute demo link before submission (`TODO`).
 
-**Dead Drop** is a 1v1 strategy game of hidden information where "trust me" isn't good enough. 
+## What the Game Is
 
-In traditional multiplayer games, a central server knows everything—it hides the treasure, it resolves the moves, and players must trust it not to cheat. In **Dead Drop**, we solve the **"God View" Paradox** using Zero-Knowledge proofs.
+**Dead Drop** is a 2-player hidden-information game on a **100x100 toroidal grid** (wrap-around edges).
 
-**The Drop exists nowhere.** It is mathematically defined by the sum of two secret coordinates held privately by the players. Neither player knows where it is at the start, but both can mathematically prove how far they are from it without ever revealing their secrets.
+- Players create/join a lobby using a room code.
+- The game starts onchain with a hidden `drop_commitment`.
+- Players alternate turns submitting a ping coordinate.
+- The game reveals the **distance** from the ping to the hidden drop, but not the drop location.
+- A turn is only accepted if the submitted distance is backed by a valid ZK proof.
+- The first exact hit (`distance == 0`) wins, or the best distance wins after max turns.
 
-## 🧠 The Mechanic: "Nuclear Keys" Protocol
+## Why ZK Is Essential (Not Just Mentioned)
 
-We use a **Distributed Secret Sharing** scheme powered by **Noir + UltraHonk** and **Stellar Soroban**:
+Without ZK, one player (or a server) could lie about the distance and manipulate the game.
 
-1.  **The Split**:
-    - **Agent A** generates secret coordinate $S_A$.
-    - **Agent B** generates secret coordinate $S_B$.
-    - The **Drop** location is $D = S_A + S_B \pmod{Grid}$.
-    - Neither player can calculate $D$ alone.
+In Dead Drop, the ZK proof is a core gameplay primitive:
 
-2.  **The Hunt**:
-    - Agent A makes a guess on the grid.
-    - Agent B's client automatically receives the guess (via WebRTC / Session Push relay) and computes the distance to the Drop.
-    - **CRITICAL STEP**: Agent B's browser generates a **ZK Proof** (using Noir + UltraHonk, entirely in-browser via WASM) that proves: *"I computed the distance correctly using my secret $S_B$, and my secret matches the Poseidon2 commitment I posted on-chain."*
+- The player submits a ping plus a **claimed distance**.
+- The contract rebuilds the expected public inputs from onchain state and submitted params.
+- The contract verifies a ZK proof via a verifier contract.
+- If the proof is valid, the distance is accepted and the turn advances.
 
-3.  **The Verification**:
-    - The proof is submitted to the **Dead Drop Contract** on Stellar.
-    - The contract verifies the proof on-chain (using the **UltraHonk Verifier**).
-    - If valid, the distance is revealed to Agent A.
-    - **Zero Information Leakage**: Agent A learns *only* the distance, nothing about $S_B$.
+What players learn:
 
-## ✨ Key Innovations
+- The ping coordinate (public)
+- The distance result (public)
 
-### 1. Frictionless "Smart Sessions" (Passkeys)
-Traditional blockchain games plague users with wallet popups for every move. Dead Drop solves this with **Smart Accounts & Session Keys**:
-*   **One-Click Login**: Authenticate instantly using FaceID/TouchID (Passkeys) via [Smart Wallet Kit](https://github.com/kalepail/smart-account-kit).
-*   **Session Keys**: The master account authorizes a temporary, scoped session key stored in the browser's local storage.
-*   **Invisible Signing**: All gameplay actions (pings, reveals) are signed automatically in the background. **Zero popups** during the heat of the game.
+What remains hidden:
 
-### 2. Instant "Room Code" Lobby
-Matchmaking shouldn't require copy-pasting long public keys.
-*   **Host**: Creates a game and receives a simple 6-digit code.
-*   **Join**: Opponent enters the code to connect.
-*   **Single-Sig Architecture**: The contract is designed for asynchronous, single-sided funding. The host funds their stake, the joiner funds theirs, and the Game Hub atomically links them.
+- The actual drop coordinates
+- Private witness values used to prove the distance computation
 
-### 3. Trustless P2P State Channels
-While the contract enforces rules, the gameplay happens at the speed of the web.
-*   **WebRTC**: Agents establish a direct peer-to-peer data channel for sub-second latency.
-*   **Optimistic UI**: The frontend visualizes results immediately while the ZK proof is verifying on-chain.
-*   **Auto-Responder**: Your client automatically generates proofs for your opponent's queries, creating a seamless "server-like" experience without a central server.
+This is exactly the kind of “trust me is not good enough” mechanic the hackathon asks for.
 
-### 4. Gasless Gameplay (Relayer)
-New users shouldn't need XLM to start playing.
-*   **OpenZeppelin Relayer**: We integrate with [OpenZeppelin Defender](https://developers.stellar.org/docs/tools/openzeppelin-relayer) to sponsor transaction fees.
-*   **Meta-Transactions**: Users sign the game actions (pings), but the Relayer submits the transaction and pays the gas. This allows for a true "Web2-like" onboarding flow where an email/passkey is all you need.
+## Architecture (Current Prototype)
 
-### 5. Provable "Unfairness" (Gadgets)
-We use a **Shared Entropy** protocol to generate deterministic, hidden power-ups.
-*   **Seeded from Commitments**: The combined hash of both players' secrets `H(Sa + Sb)` seeds a deterministic RNG.
-*   **ZK-Verified Abilities**: Players can use gadgets like **Sat-Link** (reveal a quadrant) or **Intercept** (steal opponent's distance).
-*   **The Innovation**: The contract doesn't know *what* gadget you have, only that you have a valid proof deriving it from the shared seed. This allows for complex "fog of war" mechanics on a public ledger.
+### Onchain (Stellar Soroban)
 
-## 🎥 Demo
+- `contracts/dead-drop/src/lib.rs`
+  - Lobby flow: `open_game`, `join_game`
+  - Gameplay: `submit_ping`, `force_timeout`
+  - Reads: `get_game`, `get_lobby`
+  - Calls Game Hub `start_game()` / `end_game()`
+  - Verifies:
+    - ping proofs via verifier contract (`verify_proof`)
+    - randomness attestation via randomness verifier (`verify_randomness`)
 
-[![Watch the Demo](https://img.youtube.com/vi/placeholder/0.jpg)](https://www.youtube.com/watch?v=placeholder)
+### Backend (Prover + Relayer + State API)
 
-*Watch the 2-minute walkthrough of a full game session.*
+- `backend/dead-drop-prover/server.js`
+  - `/randomness/session` for per-session randomness artifacts
+  - `/prove/ping` for ZK proof generation
+  - `/tx/submit` and `/tx/submit-direct` for relayer/direct submission
+  - `/events/ping` and `/game/state` for frontend sync
+- `backend/dead-drop-prover/prover.js`
+  - Generates proofs using Noir artifacts + `snarkjs` Groth16
+- `backend/dead-drop-prover/eventIndexer.js`
+  - Indexes ping events for frontend display
+- `backend/dead-drop-prover/gameStateService.js`
+  - Reads contract state and returns merged game + events snapshot
+- `backend/dead-drop-prover/relayer.js`
+  - OpenZeppelin Channels relayer integration
 
-## 🏗️ Architecture
+### Frontend (Playable Web Game)
+
+- `dead-drop-frontend/`
+  - React + Vite UI
+  - Wallet integration (dev wallets / Stellar signers)
+  - Lobby + room code UX
+  - Turn-based map interaction
+  - Backend-powered proof generation and game-state syncing
+  - Relayer path with direct fallback for unsupported auth shapes
 
 ```mermaid
 graph TD
-    subgraph Clients
-        A[Agent A Browser] -->|Ping request via WebRTC / Session Push| B[Agent B Browser]
-        B -->|Proof response| A
-    end
+  A[Player Browser - React UI] -->|open/join/ping actions| B[Dead Drop Backend API]
+  A -->|tx signing| C[Wallet / signer]
+  B -->|/prove/ping| D[Noir artifacts + snarkjs Groth16 prover]
+  B -->|/tx/submit| E[OZ Channels Relayer]
+  B -->|/tx/submit-direct fallback| F[Backend fee payer submit]
+  B -->|/game/state + /events/ping| G[State service + event indexer]
 
-    subgraph Noir_UltraHonk
-        B -->|Private inputs: x, y, salt| P[NoirJS + bb.js WASM]
-        P -->|UltraHonk proof + public inputs| B
-    end
+  E --> H[Stellar Testnet]
+  F --> H
+  C --> H
 
-    subgraph Stellar_Soroban
-        A -->|submit_ping: proof + public inputs| C[Dead Drop Contract]
-        C <-->|verify proof| V[UltraHonk Verifier Contract]
-        C -->|Update State| S[Ledger State]
-    end
+  H --> I[Dead Drop Soroban Contract]
+  I --> J[Game Hub Contract]
+  I --> K[ZK Verifier Contract]
+  I --> L[Randomness Verifier Contract]
 ```
 
-## 🛠️ Tech Stack
+## Technologies Used (What / Why / How)
 
-*   **Smart Contracts**: Stellar Soroban (Rust)
-    *   Implements game state machine, Poseidon2 commitments, and UltraHonk proof verification.
-*   **ZK Proving**: Noir (`@noir-lang/noir_js ^1.0.0-beta.18`) + Barretenberg (`@aztec/bb.js ^2.1.11`)
-    *   Circuit written in Noir, compiled to ACIR bytecode.
-    *   All proofs generated **client-side** in the browser via WASM — no backend prover needed.
-    *   Commitment scheme: `Poseidon2(x, y, salt)` via `@zkpassport/poseidon2`.
-*   **Verification**: UltraHonk Verifier Contract
-    *   On-chain verification of UltraHonk proofs.
-*   **P2P Transport**: WebRTC DataChannel + Session Push relay
-    *   Responder proves in-browser, sends proof to pinger over direct P2P or HTTP relay fallback.
-*   **Frontend**: React + Stellar SDK + Tone.js
-    *   Connects to standard Stellar wallets (Freighter) or dev signers.
-    *   Real-time sound engine for ambient loop and gameplay feedback.
+| Technology | Why it matters for this hackathon | How this project uses it |
+|---|---|---|
+| **Stellar Soroban (Rust)** | Required onchain component; enforces game rules and verifiable outcomes | `contracts/dead-drop/src/lib.rs` implements lobby/game state machine, turn rules, proof verification calls, and Game Hub integration |
+| **Stellar Game Studio** | Speeds up onchain game development and required ecosystem integration patterns | Repo structure, scripts (`setup`, `build`, `deploy`, `bindings`, `dev:game`), Game Hub integration conventions |
+| **Stellar Game Hub** | Required for hackathon lifecycle tracking | Dead Drop contract calls `start_game()` and `end_game()` |
+| **`@stellar/stellar-sdk`** | Core client + backend interaction with Soroban/Testnet | Used in frontend tx building/signing and backend RPC/transaction submission |
+| **Noir (circuit artifacts / interop witness generation)** | ZK circuit authoring path for distance proof logic | Circuit artifacts live under `circuits/dead_drop/`; backend prover uses `noir-cli interop` to generate witness |
+| **Groth16 + `snarkjs`** | Practical proof generation for prototype ZK mechanic | `backend/dead-drop-prover/prover.js` generates ping proofs and public signals using Groth16 |
+| **Poseidon2 (`@zkpassport/poseidon2`)** | ZK-friendly hashing relevant to Protocol 25 / modern ZK systems | Used in backend prover to compute/validate drop commitments |
+| **OpenZeppelin Relayer Channels** | Gasless / sponsored submission UX and better onboarding | Backend relayer integration via `backend/dead-drop-prover/relayer.js`; frontend submits via `/tx/submit` |
+| **React + Vite** | Fast iteration and judge-friendly playable UI | `dead-drop-frontend` game UI, lobby/join flow, state sync, map rendering |
+| **Backend Game State Service + Event Indexer** | Smooth gameplay UX despite RPC/cache lag | `/game/state` and `/events/ping` aggregate onchain state/events for frontend |
+| **Tone.js** | Better player experience (feedback matters in demos) | Ambient and gameplay sound cues in Dead Drop frontend |
+| **WebSocket relay / real-time backend endpoints** | Supports multiplayer coordination and proof/result exchange patterns | Relay endpoints exist in backend (`/relay/*`, websocket server) and support real-time flows |
 
-## 🚀 Getting Started
+## ZK Mechanic Deep Dive (Implemented Flow)
+
+### Hidden Drop Commitment
+
+- A per-session randomness flow produces:
+  - `randomness_output`
+  - `randomness_signature`
+  - `drop_commitment`
+- The contract verifies the randomness artifacts using a randomness verifier contract before starting the game.
+
+### Ping Proof Flow
+
+1. A player chooses a ping coordinate `(ping_x, ping_y)`.
+2. Frontend requests proof generation from backend `/prove/ping`.
+3. Backend prover computes the wrapped Manhattan distance and generates a ZK proof.
+4. Frontend submits `submit_ping` with:
+   - `proof`
+   - `public_inputs`
+   - ping metadata
+5. Dead Drop contract:
+   - checks turn ownership / turn number
+   - reconstructs expected public inputs from onchain state
+   - validates the submitted public inputs match expected values
+   - calls verifier contract to verify proof
+   - emits ping event and advances game state
+
+### Public Inputs Layout (Contract-Enforced)
+
+From `contracts/dead-drop/src/lib.rs`:
+
+- `[session_id, turn, ping_x, ping_y, drop_commitment, expected_distance]`
+
+This matters because the contract independently reconstructs this layout before accepting a proof.
+
+## Onchain Component + Game Hub Compliance (Hackathon Requirement #2)
+
+- **Required Game Hub contract ID (hackathon prompt)**:
+  - `CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG`
+- This repo’s `deployment.json` currently points `mockGameHubId` / `mock-game-hub` to that same ID on testnet.
+- Dead Drop contract calls:
+  - `start_game()` when a match starts (including lobby `join_game`)
+  - `end_game()` when a winner is finalized
+
+Relevant contract file:
+
+- `contracts/dead-drop/src/lib.rs`
+
+## Current Testnet Deployment (from `deployment.json`)
+
+- Network: `testnet`
+- RPC: `https://soroban-testnet.stellar.org`
+- Dead Drop contract: `CAX44ZGBZM3X6L7RFCX2V7SFWNPHWZZDYMWN6DXPJ4G4KH6AIIAAIN6I`
+- Game Hub (required): `CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG`
+- Dead Drop verifier contract: `CA7T3FJMCIJ6HA3Z56VVD7J5A2HLZ5JLWNPODB43GML7JJSQHSWWSQKC`
+- Dead Drop randomness verifier contract: `CCN7MNB7GCJG23NZKMUCCPCMSMYZK7UA5NOXZD5GCJLCITWZIOIGHVVF`
+
+Note: If you redeploy, update the README and frontend/runtime config before final submission.
+
+## Repository Structure (Judge-Friendly)
+
+- `contracts/dead-drop/` — Soroban game contract (lobby, gameplay, proof verification, Game Hub calls)
+- `dead-drop-frontend/` — React/Vite game UI and transaction orchestration
+- `backend/dead-drop-prover/` — backend prover, relayer integration, event indexer, game-state API
+- `circuits/dead_drop/` — Noir circuit + Groth16 artifacts (`.zkey`, circuit JSON)
+- `bindings/` — generated TS bindings for contracts
+- `scripts/` — build/deploy/bindings/dev workflows (Stellar Game Studio)
+- `deployment.json` — current testnet contract IDs and runtime metadata
+- `risc0/` — experimental/reference proof flow work (not the default Dead Drop runtime path)
+- `zk-circuits/` — additional circuit artifacts/reference assets (non-primary runtime path)
+
+## Getting Started (Local Demo)
 
 ### Prerequisites
 
-*   [Bun](https://bun.sh/) (v1.0+)
-*   [Rust](https://www.rust-lang.org/) (latest stable)
-*   [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools/cli/stellar-cli) (`stellar`)
+- [Bun](https://bun.sh/)
+- [Rust](https://www.rust-lang.org/)
+- Stellar CLI / Soroban tooling (for contract build/deploy workflows)
 
-### Installation
+### Install
 
-1.  **Clone the repository**
-    ```bash
-    git clone https://github.com/your-username/dead-drop.git
-    cd dead-drop
-    ```
+```bash
+bun install
+```
 
-2.  **Install dependencies**
-    ```bash
-    bun install
-    ```
+### Setup (contracts + bindings + env)
 
-3.  **Setup Local Environment**
-    This script compiles contracts, deploys them to Testnet, and generates TypeScript bindings.
-    ```bash
-    bun run setup
-    ```
+```bash
+bun run setup
+```
 
-### running the Game
+### Run the backend prover/relayer API
 
-1.  **Start the Development Server**
-    ```bash
-    bun run dev:game dead-drop
-    ```
+```bash
+bun run dev:prover
+```
 
-2.  **Play!**
-    *   Open `http://localhost:5173`.
-    *   Connect your wallet (Freighter recommended).
-    *   Create a game and invite a friend (or use a second browser window with a different wallet).
+### Run the frontend game
 
-## 🧩 How to Win (The Hackathon Track)
+```bash
+bun run dev:game dead-drop
+```
 
-We are submitting to the **ZK Gaming on Stellar** track.
+Then open the local frontend (typically Vite on localhost) in two browser windows / profiles and use two wallets (or dev wallets) to play.
 
-*   **ZK-Native Mechanic**: The game *cannot exist* without ZK. The hidden information is the core puzzle.
-*   **Protocol 25**: We leverage the new BN254/Poseidon host functions for efficient on-chain verification.
-*   **Fairness**: Provable fairness is baked into every turn. No trusted server required.
+### Optional proof flow validation
 
-## 📜 License
+```bash
+bun run proof:test:dead-drop
+```
 
-MIT License.
+## Demo Script (2–3 Minute Video) — `TODO before submission`
 
----
-*Built with [Stellar Game Studio](https://github.com/jamesbachini/Stellar-Game-Studio)*
+Recommended demo sequence:
+
+1. Explain the hidden-information problem (why ZK matters)
+2. Show `open_game` (host creates lobby / room code)
+3. Show `join_game` (opponent joins)
+4. Submit a ping and show distance result
+5. Explain proof generation + onchain verification path
+6. Show onchain transaction hash / testnet contract reference
+7. Summarize why this is fair-by-design on Stellar
+
+Add final video link here before submission:
+
+- `TODO: https://...`
+
+## Why This Can Win the Hackathon
+
+### 1. ZK is a real gameplay primitive
+
+Dead Drop uses ZK to enforce a mechanic players actually care about:
+
+- hidden information (drop location)
+- fair resolution (distance correctness)
+- verifiable outcomes onchain
+
+If you remove ZK, the game loses its trust model.
+
+### 2. The prototype is full-stack and playable
+
+- Soroban contract on testnet
+- verifier integration
+- frontend UI
+- backend prover + relayer path
+- multiplayer flow (lobby/join/turns)
+
+Judges can play it and see the ZK mechanic in action.
+
+### 3. Strong Stellar relevance
+
+- Built in the Stellar/Soroban ecosystem
+- Integrates Game Hub lifecycle (`start_game` / `end_game`)
+- Uses ZK-friendly primitives and a design aligned with the Protocol 25 / X-Ray direction (BN254/Poseidon-era ZK game mechanics on Stellar)
+
+## Known Limitations (Honest Prototype Notes)
+
+- Current default proof generation path is **backend-assisted** (`/prove/ping`) rather than fully in-browser proving.
+- Multiplayer sync is production-hardened for prototype use, but still relies on backend state/event aggregation for smooth UX.
+- Several ZK/RISC0-related folders in the repo are experimental/reference work and not the default Dead Drop runtime path.
+
+## Submission Requirements Mapping
+
+1. **ZK-Powered Mechanic**  
+   Dead Drop uses ZK proof verification as the core ping-distance mechanic.
+
+2. **Deployed Onchain Component (Stellar Testnet)**  
+   Dead Drop Soroban contract + verifier contracts; Game Hub integration included.
+
+3. **Front End**  
+   Playable `dead-drop-frontend` with lobby, join, and ping flows.
+
+4. **Open-source Repo**  
+   This repository.
+
+5. **Video Demo**  
+   `TODO` add final 2–3 minute demo URL before submission.
+
+## Acknowledgements
+
+- [Stellar Game Studio](https://github.com/jamesbachini/Stellar-Game-Studio)
+- Stellar ZK Gaming hackathon organizers and community support channels
+
+## License
+
+MIT
+

@@ -11,6 +11,7 @@
     "create": "bun run scripts/create.ts",
     "publish": "bun run scripts/publish.ts",
     "dev:prover": "node backend/dead-drop-prover/index.js",
+    "proof:test:dead-drop": "bun run scripts/test-dead-drop-proof-flow.ts",
     "dev": "bun --cwd=dead-drop-frontend run dev",
     "dev:game": "bun run scripts/dev-game.ts"
   },

@@ -1,0 +1,11 @@
+{
+  "drop_x": "50",
+  "drop_y": "50",
+  "drop_salt": "0x0000000000000000000000000000000000000000000000000000000000000001",
+  "session_id": "1",
+  "turn": "1",
+  "ping_x": "50",
+  "ping_y": "50",
+  "expected_commitment": "0x2064c671ff76b4e70734bf235cc6c724940f63f54cd99d63fad9b51702fb6c2a",
+  "expected_distance": "0"
+}

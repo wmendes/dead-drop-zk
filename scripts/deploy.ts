@@ -51,6 +51,8 @@ Examples:
   bun run deploy
   bun run deploy number-guess
   bun run deploy twenty-one number-guess
+  bun run deploy --admin-identity alice
+  bun run deploy --admin-identity alice --repair-dead-drop
 `);
 }
 
@@ -99,14 +101,78 @@ async function testnetContractExists(contractId: string): Promise<boolean> {
   }
 }
 
-const args = process.argv.slice(2);
-if (args.includes("--help") || args.includes("-h")) {
+type DeploySource =
+  | { mode: "identity"; sourceAccount: string; adminAddress: string; adminIdentity: string }
+  | { mode: "secret"; sourceAccount: string; adminAddress: string; adminSecret: string };
+
+async function resolveIdentityAddress(identity: string): Promise<string> {
+  try {
+    return (await $`stellar keys address ${identity}`.text()).trim();
+  } catch (error) {
+    console.error(`❌ Failed to resolve Stellar CLI identity "${identity}".`);
+    console.error("Run `stellar keys ls` to list available identities.");
+    process.exit(1);
+  }
+}
+
+async function contractHasVerifyRandomness(contractId: string): Promise<boolean> {
+  if (!contractId) return false;
+  if (!await testnetContractExists(contractId)) return false;
+
+  const zero32 = "0".repeat(64);
+  const zero64 = "0".repeat(128);
+  try {
+    await $`stellar contract invoke --id ${contractId} --network ${NETWORK} -- verify_randomness --session-id 1 --randomness-output ${zero32} --drop-commitment ${zero32} --randomness-signature ${zero64}`.text();
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (
+      msg.includes("trying to invoke non-existent contract function")
+      || msg.includes("function")
+      || msg.includes("verify_randomness")
+    ) {
+      return false;
+    }
+    // If the function exists but invocation fails for another reason, treat it as present.
+    return true;
+  }
+}
+
+const rawArgs = process.argv.slice(2);
+if (rawArgs.includes("--help") || rawArgs.includes("-h")) {
   usage();
   process.exit(0);
 }
 
+let adminIdentityName = "";
+let repairDeadDrop = false;
+let forceMockRandomnessVerifier = false;
+const contractTargets: string[] = [];
+for (let i = 0; i < rawArgs.length; i++) {
+  const arg = rawArgs[i];
+  if (arg === "--admin-identity") {
+    const next = rawArgs[i + 1];
+    if (!next || next.startsWith("-")) {
+      console.error("❌ --admin-identity requires an identity name (e.g. alice)");
+      process.exit(1);
+    }
+    adminIdentityName = next;
+    i += 1;
+    continue;
+  }
+  if (arg === "--repair-dead-drop") {
+    repairDeadDrop = true;
+    continue;
+  }
+  if (arg === "--force-mock-randomness-verifier") {
+    forceMockRandomnessVerifier = true;
+    continue;
+  }
+  contractTargets.push(arg);
+}
+
 const allContracts = await getWorkspaceContracts();
-const selection = selectContracts(allContracts, args);
+const selection = selectContracts(allContracts, contractTargets);
 if (selection.unknown.length > 0 || selection.ambiguous.length > 0) {
   console.error("❌ Error: Unknown or ambiguous contract names.");
   if (selection.unknown.length > 0) {
@@ -247,12 +313,30 @@ for (const contract of allContracts) {
   if (envId) existingContractIds[contract.packageName] = envId;
 }
 
-// Handle admin identity (needs to be in Stellar CLI for deployment)
+// Handle admin identity/source account for deployment and future admin updates.
 console.log('Setting up admin identity...');
-console.log('📝 Generating new admin identity...');
-const adminKeypair = Keypair.random();
-
-walletAddresses.admin = adminKeypair.publicKey();
+let deploySource: DeploySource;
+if (adminIdentityName) {
+  const adminAddress = await resolveIdentityAddress(adminIdentityName);
+  walletAddresses.admin = adminAddress;
+  deploySource = {
+    mode: "identity",
+    sourceAccount: adminIdentityName,
+    adminAddress,
+    adminIdentity: adminIdentityName,
+  };
+  console.log(`✅ Using local Stellar identity "${adminIdentityName}" as admin (${adminAddress})`);
+} else {
+  console.log('📝 Generating new admin identity...');
+  const adminKeypair = Keypair.random();
+  walletAddresses.admin = adminKeypair.publicKey();
+  deploySource = {
+    mode: "secret",
+    sourceAccount: adminKeypair.secret(),
+    adminAddress: adminKeypair.publicKey(),
+    adminSecret: adminKeypair.secret(),
+  };
+}
 
 try {
   await ensureTestnetFunded(walletAddresses.admin);
@@ -298,11 +382,34 @@ console.log(`  Admin:   ${walletAddresses.admin}`);
 console.log(`  Player1: ${walletAddresses.player1}`);
 console.log(`  Player2: ${walletAddresses.player2}\n`);
 
-// Use admin secret for contract deployment
-const adminAddress = walletAddresses.admin;
-const adminSecret = adminKeypair.secret();
+// Use the selected admin source (CLI identity alias or raw secret) for contract deployment
+const adminAddress = deploySource.adminAddress;
+const adminSourceAccount = deploySource.sourceAccount;
 
 const deployed: Record<string, string> = { ...existingContractIds };
+const deadDropSelected = contracts.some((c) => c.packageName === "dead-drop");
+let resolvedDeadDropProofVerifierId = deadDropVerifierMode === "real"
+  ? deadDropVerifierContractId
+  : "";
+let resolvedDeadDropRandomnessVerifierId = "";
+
+const configuredRandomnessVerifierCandidate =
+  deadDropRandomnessVerifierContractId || (deadDropVerifierMode === "real" ? deadDropVerifierContractId : "");
+let configuredRandomnessVerifierValid = false;
+if (configuredRandomnessVerifierCandidate) {
+  configuredRandomnessVerifierValid = await contractHasVerifyRandomness(configuredRandomnessVerifierCandidate);
+  if (!configuredRandomnessVerifierValid) {
+    console.warn(
+      `⚠️  Configured Dead Drop randomness verifier does not expose verify_randomness: ${configuredRandomnessVerifierCandidate}`
+    );
+  }
+}
+
+const needsRandomnessVerifierFallback = forceMockRandomnessVerifier || !configuredRandomnessVerifierValid;
+const needsMockVerifierForDeadDrop = deadDropSelected && (
+  deadDropVerifierMode !== "real"
+  || needsRandomnessVerifierFallback
+);
 
 // Ensure mock Game Hub exists so we can pass it into game constructors.
 let mockGameHubId = existingContractIds[mock.packageName] || "";
@@ -335,7 +442,7 @@ if (shouldEnsureMock) {
     console.log(`Deploying ${mock.packageName}...`);
     try {
       const result =
-        await $`stellar contract deploy --wasm ${mock.wasmPath} --source-account ${adminSecret} --network ${NETWORK}`.text();
+        await $`stellar contract deploy --wasm ${mock.wasmPath} --source-account ${adminSourceAccount} --network ${NETWORK}`.text();
       mockGameHubId = result.trim();
       deployed[mock.packageName] = mockGameHubId;
       console.log(`✅ ${mock.packageName} deployed: ${mockGameHubId}\n`);
@@ -346,21 +453,34 @@ if (shouldEnsureMock) {
   }
 }
 
-// Deploy mock-verifier first if requested (no constructor args)
-const mockVerifierContract = contracts.find((c) => c.packageName === "mock-verifier");
+// Deploy mock-verifier first if requested or needed by dead-drop verifier wiring (no constructor args)
+const mockVerifierContract = allContracts.find((c) => c.packageName === "mock-verifier");
 let mockVerifierId = deployed["mock-verifier"] || "";
-if (mockVerifierContract && deadDropVerifierMode !== "real") {
+const shouldEnsureMockVerifier =
+  (mockVerifierContract && (deadDropVerifierMode !== "real" || forceMockRandomnessVerifier))
+  || needsMockVerifierForDeadDrop;
+if (shouldEnsureMockVerifier) {
+  if (!mockVerifierContract) {
+    console.error("❌ mock-verifier contract must be present in workspace to satisfy Dead Drop verifier wiring.");
+    process.exit(1);
+  }
+  if (mockVerifierId && !(await testnetContractExists(mockVerifierId))) {
+    console.warn(`⚠️  Existing mock-verifier contract not found on testnet: ${mockVerifierId}`);
+    mockVerifierId = "";
+  }
+}
+if (mockVerifierContract && shouldEnsureMockVerifier && !mockVerifierId) {
   console.log(`Deploying ${mockVerifierContract.packageName}...`);
   try {
     console.log("  Installing WASM...");
     const installResult =
-      await $`stellar contract install --wasm ${mockVerifierContract.wasmPath} --source-account ${adminSecret} --network ${NETWORK}`.text();
+      await $`stellar contract install --wasm ${mockVerifierContract.wasmPath} --source-account ${adminSourceAccount} --network ${NETWORK}`.text();
     const wasmHash = installResult.trim();
     console.log(`  WASM hash: ${wasmHash}`);
 
     console.log("  Deploying (no constructor)...");
     const deployResult =
-      await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK}`.text();
+      await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSourceAccount} --network ${NETWORK}`.text();
     const contractId = deployResult.trim();
     deployed[mockVerifierContract.packageName] = contractId;
     mockVerifierId = contractId;
@@ -369,6 +489,29 @@ if (mockVerifierContract && deadDropVerifierMode !== "real") {
     console.error(`❌ Failed to deploy ${mockVerifierContract.packageName}:`, error);
     process.exit(1);
   }
+}
+
+if (deadDropVerifierMode !== "real") {
+  resolvedDeadDropProofVerifierId = mockVerifierId || existingContractIds["mock-verifier"] || "";
+}
+if (!resolvedDeadDropProofVerifierId) {
+  console.error("❌ dead-drop proof verifier contract ID is required but unresolved.");
+  process.exit(1);
+}
+
+if (!needsRandomnessVerifierFallback && configuredRandomnessVerifierCandidate) {
+  resolvedDeadDropRandomnessVerifierId = configuredRandomnessVerifierCandidate;
+} else {
+  resolvedDeadDropRandomnessVerifierId = mockVerifierId || existingContractIds["mock-verifier"] || "";
+  if (!resolvedDeadDropRandomnessVerifierId) {
+    console.error(
+      "❌ Could not resolve a valid Dead Drop randomness verifier. " +
+      "Set DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID to a contract with verify_randomness(), " +
+      "or allow/deploy mock-verifier."
+    );
+    process.exit(1);
+  }
+  console.log(`✅ Using mock-verifier for Dead Drop randomness verifier: ${resolvedDeadDropRandomnessVerifierId}`);
 }
 
 // Deploy remaining contracts
@@ -380,7 +523,7 @@ for (const contract of contracts) {
   try {
     console.log("  Installing WASM...");
     const installResult =
-      await $`stellar contract install --wasm ${contract.wasmPath} --source-account ${adminSecret} --network ${NETWORK}`.text();
+      await $`stellar contract install --wasm ${contract.wasmPath} --source-account ${adminSourceAccount} --network ${NETWORK}`.text();
     const wasmHash = installResult.trim();
     console.log(`  WASM hash: ${wasmHash}`);
 
@@ -388,20 +531,18 @@ for (const contract of contracts) {
     let deployResult: string;
 
     if (contract.packageName === "dead-drop") {
-      // dead-drop needs verifier_id and ping_image_id in addition to admin + game_hub
-      const verifierId = deadDropVerifierMode === "real"
-        ? deadDropVerifierContractId
-        : (mockVerifierId || existingContractIds["mock-verifier"] || "");
+      // dead-drop needs proof verifier + randomness verifier in addition to admin + game_hub
+      const verifierId = resolvedDeadDropProofVerifierId;
+      const randomnessVerifierId = resolvedDeadDropRandomnessVerifierId || verifierId;
       if (!verifierId) {
         console.error("❌ dead-drop verifier contract ID is required. Set DEAD_DROP_VERIFIER_CONTRACT_ID for real mode or deploy mock-verifier for mock mode.");
         process.exit(1);
       }
-      const randomnessVerifierId = deadDropRandomnessVerifierContractId || verifierId;
       deployResult =
-        (await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId} --verifier-id ${verifierId} --randomness-verifier-id ${randomnessVerifierId}`.text());
+        (await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSourceAccount} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId} --verifier-id ${verifierId} --randomness-verifier-id ${randomnessVerifierId}`.text());
     } else {
       deployResult =
-        (await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId}`.text());
+        (await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSourceAccount} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId}`.text());
     }
 
     const contractId = deployResult.trim();
@@ -409,6 +550,30 @@ for (const contract of contracts) {
     console.log(`✅ ${contract.packageName} deployed: ${contractId}\n`);
   } catch (error) {
     console.error(`❌ Failed to deploy ${contract.packageName}:`, error);
+    process.exit(1);
+  }
+}
+
+if (repairDeadDrop) {
+  const deadDropId = deployed["dead-drop"] || existingContractIds["dead-drop"] || existingDeployment?.contracts?.["dead-drop"] || "";
+  if (!deadDropId) {
+    console.error("❌ --repair-dead-drop requested but no dead-drop contract ID is available.");
+    process.exit(1);
+  }
+  console.log(`🔧 Repairing dead-drop verifier wiring for ${deadDropId}...`);
+  try {
+    const currentRandomnessVerifier =
+      (await $`stellar contract invoke --id ${deadDropId} --network ${NETWORK} -- get_randomness_verifier`.text()).trim();
+    console.log(`  Current randomness verifier: ${currentRandomnessVerifier}`);
+    console.log(`  Desired randomness verifier: ${resolvedDeadDropRandomnessVerifierId}`);
+    if (currentRandomnessVerifier !== resolvedDeadDropRandomnessVerifierId) {
+      await $`stellar contract invoke --id ${deadDropId} --source-account ${adminSourceAccount} --network ${NETWORK} -- set_randomness_verifier --new-verifier ${resolvedDeadDropRandomnessVerifierId}`.text();
+      console.log("  ✅ Updated dead-drop randomness verifier");
+    } else {
+      console.log("  ✅ dead-drop randomness verifier already correct");
+    }
+  } catch (error) {
+    console.error("❌ Failed to repair dead-drop randomness verifier:", error);
     process.exit(1);
   }
 }
@@ -447,14 +612,8 @@ const deploymentInfo = {
   },
   deadDrop: {
     verifierMode: deadDropVerifierMode,
-    verifierContractId: deadDropVerifierMode === "real"
-      ? deadDropVerifierContractId
-      : (mockVerifierId || existingContractIds["mock-verifier"] || ""),
-    randomnessVerifierContractId: deadDropRandomnessVerifierContractId || (
-      deadDropVerifierMode === "real"
-        ? deadDropVerifierContractId
-        : (mockVerifierId || existingContractIds["mock-verifier"] || "")
-    ),
+    verifierContractId: resolvedDeadDropProofVerifierId,
+    randomnessVerifierContractId: resolvedDeadDropRandomnessVerifierId || resolvedDeadDropProofVerifierId,
     proverUrl: deadDropProverUrl,
     relayerUrl: deadDropRelayerUrl,
   },
@@ -463,6 +622,10 @@ const deploymentInfo = {
     smartAccountWasmHash,
     smartAccountWebauthnVerifierAddress,
     smartAccountRpName,
+  },
+  deploy: {
+    adminIdentity: deploySource.mode === "identity" ? deploySource.adminIdentity : "",
+    adminMode: deploySource.mode,
   },
   deployedAt: new Date().toISOString(),
 };
@@ -484,6 +647,7 @@ ${contractEnvLines}
 VITE_DEAD_DROP_PROVER_URL=${deadDropProverUrl}
 VITE_DEAD_DROP_RELAYER_URL=${deadDropRelayerUrl}
 VITE_DEAD_DROP_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.verifierContractId}
+VITE_DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.randomnessVerifierContractId}
 VITE_WALLET_MODE=${walletMode}
 VITE_SMART_ACCOUNT_WASM_HASH=${smartAccountWasmHash}
 VITE_SMART_ACCOUNT_WEBAUTHN_VERIFIER_ADDRESS=${smartAccountWebauthnVerifierAddress}
@@ -500,6 +664,8 @@ VITE_DEV_PLAYER2_SECRET=${walletSecrets.player2}
 
 # Dead Drop verifier/prover mode
 DEAD_DROP_VERIFIER_MODE=${deadDropVerifierMode}
+DEAD_DROP_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.verifierContractId}
+DEAD_DROP_RANDOMNESS_VERIFIER_CONTRACT_ID=${deploymentInfo.deadDrop.randomnessVerifierContractId}
 # Optional local debug override: fixed hidden drop coordinate as "x,y" (0-99)
 DEAD_DROP_FIXED_COORDINATE=${deadDropFixedCoordinate}
 OZ_RELAYER_API_KEY=${ozRelayerApiKey}

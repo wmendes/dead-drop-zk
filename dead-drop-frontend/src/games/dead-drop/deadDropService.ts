@@ -7,6 +7,7 @@ import {
   MULTI_SIG_AUTH_TTL_MINUTES,
   RUNTIME_SIMULATION_SOURCE,
   DEV_PLAYER1_ADDRESS,
+  DEAD_DROP_RELAYER_URL,
 } from '@/utils/constants';
 import { contract, TransactionBuilder, StrKey, xdr, Address, authorizeEntry, rpc } from '@stellar/stellar-sdk';
 import { Buffer } from 'buffer';
@@ -17,7 +18,8 @@ import type { ContractSigner } from '@/types/signer';
 
 type ClientOptions = contract.ClientOptions;
 type ClientSigner = Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>;
-type MutationSigner = ClientSigner & Pick<ContractSigner, 'executeAssembledTransaction'>;
+type MutationSigner = ClientSigner;
+const DEAD_DROP_DEBUG = import.meta.env.DEV || import.meta.env.VITE_DEAD_DROP_DEBUG === 'true';
 
 /**
  * Service for interacting with the Dead Drop game contract.
@@ -37,6 +39,7 @@ export interface DeadDropRandomnessArtifacts {
 export interface SubmitPingResult {
   result: unknown;
   txHash?: string;
+  ledger?: number;
 }
 
 export interface SubmitPingProofArtifacts {
@@ -53,13 +56,53 @@ export interface PingEventRecord {
   txHash?: string;
 }
 
+export type DeadDropServiceErrorKind =
+  | 'invalid_public_inputs'
+  | 'proof_verification_failed'
+  | 'randomness_verification_failed'
+  | 'not_your_turn'
+  | 'invalid_turn'
+  | 'game_not_found'
+  | 'lobby_not_found'
+  | 'rpc_stale_read'
+  | 'rpc_ledger_range'
+  | 'unknown';
+
+export class DeadDropServiceError extends Error {
+  kind: DeadDropServiceErrorKind;
+  contractCode?: number;
+  action?: string;
+  latestLedger?: number;
+  expectedMinLedger?: number;
+  constructor(
+    kind: DeadDropServiceErrorKind,
+    message: string,
+    extras?: Partial<Pick<DeadDropServiceError, 'contractCode' | 'action' | 'latestLedger' | 'expectedMinLedger'>>
+  ) {
+    super(message);
+    this.name = 'DeadDropServiceError';
+    this.kind = kind;
+    Object.assign(this, extras);
+  }
+}
+
+type ConsistencyReadOptions = {
+  expectedMinLedger?: number;
+  maxAttempts?: number;
+  delayMs?: number;
+};
+
+type MutationClientPlan = {
+  client: DeadDropClient;
+  bypassRelayer: boolean;
+};
+
 export class DeadDropService {
   private baseClient: DeadDropClient;
   private contractId: string;
-  private pingEventsCursorBySession = new Map<number, number>();
   private submitPingProofCache = new Map<string, SubmitPingProofArtifacts>();
-  private readonly initialPingEventsBackfill = 240;
-  private readonly pingEventsRewind = 2;
+  private readonly consistencyMaxAttempts = 6;
+  private readonly consistencyDelayMs = 700;
 
   constructor(contractId: string) {
     this.contractId = contractId;
@@ -79,6 +122,36 @@ export class DeadDropService {
     );
   }
 
+  private resolveNeutralSimulationSource(): string {
+    if (StrKey.isValidEd25519PublicKey(RUNTIME_SIMULATION_SOURCE)) return RUNTIME_SIMULATION_SOURCE;
+    if (StrKey.isValidEd25519PublicKey(DEV_PLAYER1_ADDRESS)) return DEV_PLAYER1_ADDRESS;
+    throw new Error(
+      'Relayer mode requires a neutral simulation source account. Set VITE_SIMULATION_SOURCE_ADDRESS or VITE_DEV_PLAYER1_ADDRESS.'
+    );
+  }
+
+  private resolveMutationBuildSource(userAddress: string): string {
+    const isStdWallet = StrKey.isValidEd25519PublicKey(userAddress);
+    if (!DEAD_DROP_RELAYER_URL || !isStdWallet) {
+      return this.resolveInvokerPublicKey(userAddress);
+    }
+
+    const neutralSource = this.resolveNeutralSimulationSource();
+    if (neutralSource === userAddress) {
+      throw new Error(
+        'Relayer mode cannot build standard-wallet mutations with the user as transaction source. Configure VITE_SIMULATION_SOURCE_ADDRESS to a different funded account.'
+      );
+    }
+
+    if (DEAD_DROP_DEBUG) {
+      console.info('[DeadDropService][mutation-source] Using neutral simulation source for relayer', {
+        userAddress,
+        buildSource: neutralSource,
+      });
+    }
+    return neutralSource;
+  }
+
   private createSigningClient(
     publicKey: string,
     signer: ClientSigner
@@ -90,6 +163,57 @@ export class DeadDropService {
       publicKey: this.resolveInvokerPublicKey(publicKey),
       ...signer,
     });
+  }
+
+  private createMutationSigningClient(
+    userAddress: string,
+    signer: ClientSigner
+  ): DeadDropClient {
+    const publicKey = this.resolveMutationBuildSource(userAddress);
+    return new DeadDropClient({
+      contractId: this.contractId,
+      networkPassphrase: NETWORK_PASSPHRASE,
+      rpcUrl: RPC_URL,
+      publicKey,
+      ...signer,
+    });
+  }
+
+  private planMutationClient(
+    userAddress: string,
+    signer: ClientSigner
+  ): MutationClientPlan {
+    const isStdWallet = StrKey.isValidEd25519PublicKey(userAddress);
+    if (!DEAD_DROP_RELAYER_URL || !isStdWallet) {
+      return {
+        client: this.createMutationSigningClient(userAddress, signer),
+        bypassRelayer: false,
+      };
+    }
+
+    try {
+      return {
+        client: this.createMutationSigningClient(userAddress, signer),
+        bypassRelayer: false,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const canFallback =
+        message.includes('Relayer mode requires a neutral simulation source account') ||
+        message.includes('Relayer mode cannot build standard-wallet mutations with the user as transaction source');
+      if (!canFallback) throw err;
+
+      if (DEAD_DROP_DEBUG) {
+        console.warn('[DeadDropService][mutation-source] Falling back to direct wallet submission', {
+          userAddress,
+          reason: message,
+        });
+      }
+      return {
+        client: this.createSigningClient(userAddress, signer),
+        bypassRelayer: true,
+      };
+    }
   }
 
   private toClientSigner(signer: ClientSigner | MutationSigner): ClientSigner {
@@ -124,64 +248,86 @@ export class DeadDropService {
     tx: contract.AssembledTransaction<unknown>,
     signer: MutationSigner,
     authTtlMinutes: number = DEFAULT_AUTH_TTL_MINUTES,
-    allowWalletFallback: boolean = true,
+    submitOptions?: { bypassRelayer?: boolean }
   ): Promise<contract.SentTransaction<any>> {
-    if (signer.executeAssembledTransaction) {
-      try {
-        const executionResult = await signer.executeAssembledTransaction(tx);
-        if (executionResult.success) {
-          return {
-            result: undefined,
-            getTransactionResponse: {
-              status: 'SUCCESS',
-              hash: executionResult.hash,
-              ledger: executionResult.ledger,
-            },
-          } as unknown as contract.SentTransaction<any>;
-        }
-
-        if (!allowWalletFallback) {
-          throw new Error(
-            executionResult.error
-              || 'Dead Drop session signer is unavailable. Re-open or re-join the lobby to continue.'
-          );
-        }
-
-        console.warn(
-          `[DeadDropService] ${action}: session signer path failed, falling back to direct wallet signer.`,
-          executionResult.error || 'unknown error'
-        );
-      } catch (error) {
-        if (!allowWalletFallback) {
-          if (error instanceof Error) {
-            throw error;
-          }
-          throw new Error(
-            `Dead Drop session signer failed: ${String(error)}. Re-open or re-join the lobby to continue.`
-          );
-        }
-
-        console.warn(
-          `[DeadDropService] ${action}: session signer threw, falling back to direct wallet signer.`,
-          error
-        );
-      }
+    if (DEAD_DROP_DEBUG) {
+      console.info('[DeadDropService][submitMutation] Begin', {
+        action,
+        authTtlMinutes,
+      });
     }
 
     const validUntilLedgerSeq = await calculateValidUntilLedger(RPC_URL, authTtlMinutes);
-    return signAndSendViaLaunchtube(
+    if (DEAD_DROP_DEBUG) {
+      console.info('[DeadDropService][submitMutation] Using relayer/direct signer path', {
+        action,
+        validUntilLedgerSeq,
+      });
+    }
+    const sentTx = await signAndSendViaLaunchtube(
       tx,
       DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
       this.toClientSigner(signer),
-      validUntilLedgerSeq
+      validUntilLedgerSeq,
+      submitOptions
     );
+    if (DEAD_DROP_DEBUG) {
+      console.info('[DeadDropService][submitMutation] Submit completed', {
+        action,
+        status: (sentTx as any)?.getTransactionResponse?.status,
+        hash: (sentTx as any)?.getTransactionResponse?.hash,
+        ledger: (sentTx as any)?.getTransactionResponse?.ledger,
+      });
+    }
+    return sentTx;
   }
 
   // ========================================================================
   // Read-only
   // ========================================================================
 
+  /**
+   * Get game state from backend API (recommended).
+   * Backend handles RPC connection stability and caching.
+   */
+  async getGameStateFromBackend(sessionId: number): Promise<{
+    game: Game | null;
+    events: PingEventRecord[];
+    ledger: number | null;
+  }> {
+    if (!DEAD_DROP_RELAYER_URL) {
+      throw new Error('Backend URL not configured (VITE_DEAD_DROP_RELAYER_URL)');
+    }
+
+    try {
+      const response = await fetch(
+        `${DEAD_DROP_RELAYER_URL}/game/state?session_id=${sessionId}`
+      );
+
+      if (!response.ok) {
+        throw new Error(`Backend returned ${response.status}: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      return {
+        game: data.game || null,
+        events: data.events || [],
+        ledger: data.ledger,
+      };
+    } catch (err) {
+      console.error('[deadDropService] getGameStateFromBackend error:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Get game state directly from RPC (deprecated - use getGameStateFromBackend).
+   * Kept for backward compatibility and fallback.
+   */
   async getGame(sessionId: number): Promise<Game | null> {
+    if (DEAD_DROP_DEBUG) {
+      console.warn('[deadDropService] getGame() is deprecated - prefer getGameStateFromBackend()');
+    }
     try {
       const tx = await this.baseClient.get_game({ session_id: sessionId });
       const result = await tx.simulate();
@@ -192,6 +338,126 @@ export class DeadDropService {
     } catch {
       return null;
     }
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private parseLedgerRangeError(err: unknown): { minLedger: number; maxLedger: number } | null {
+    const objectMessage =
+      typeof err === 'object' && err !== null
+        ? (
+            ('message' in err && typeof (err as any).message === 'string' && (err as any).message) ||
+            ('error' in err && typeof (err as any).error?.message === 'string' && (err as any).error.message) ||
+            ('cause' in err && typeof (err as any).cause?.message === 'string' && (err as any).cause.message)
+          )
+        : null;
+    const message = err instanceof Error
+      ? err.message
+      : objectMessage
+        ?? (typeof err === 'string' ? err : (() => {
+          try {
+            return JSON.stringify(err);
+          } catch {
+            return String(err);
+          }
+        })());
+    const match = message.match(/startLedger must be within the ledger range:\s*(\d+)\s*-\s*(\d+)/i);
+    if (!match) return null;
+    return {
+      minLedger: Number(match[1]),
+      maxLedger: Number(match[2]),
+    };
+  }
+
+  async getGameWithConsistencyRetry(
+    sessionId: number,
+    options: ConsistencyReadOptions = {}
+  ): Promise<Game | null> {
+    const expectedMinLedger = options.expectedMinLedger;
+    const maxAttempts = options.maxAttempts ?? this.consistencyMaxAttempts;
+    const delayMs = options.delayMs ?? this.consistencyDelayMs;
+    const server = new rpc.Server(RPC_URL);
+
+    let lastLatestLedger: number | undefined;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const [latest, game] = await Promise.all([
+        server.getLatestLedger().catch(() => null),
+        this.getGame(sessionId),
+      ]);
+      lastLatestLedger = Number(latest?.sequence);
+      const staleRead = expectedMinLedger !== undefined
+        && Number.isFinite(lastLatestLedger)
+        && lastLatestLedger < expectedMinLedger;
+      const shouldRetryMissingAfterWrite = expectedMinLedger !== undefined && !game;
+      if (!staleRead && !shouldRetryMissingAfterWrite) {
+        return game;
+      }
+      if (DEAD_DROP_DEBUG) {
+        console.info('[DeadDropService][getGameWithConsistencyRetry] retry', {
+          sessionId,
+          attempt,
+          maxAttempts,
+          latestLedger: lastLatestLedger,
+          expectedMinLedger,
+          reason: staleRead ? 'stale-ledger' : 'missing-game-after-write',
+        });
+      }
+      if (attempt < maxAttempts) {
+        await this.sleep(delayMs);
+      }
+    }
+    if (expectedMinLedger !== undefined) {
+      return null;
+    }
+    throw new DeadDropServiceError(
+      'rpc_stale_read',
+      'RPC is lagging behind the latest game update. Please retry.',
+      { action: 'get_game', latestLedger: lastLatestLedger, expectedMinLedger }
+    );
+  }
+
+  async getLobbyWithConsistencyRetry(
+    sessionId: number,
+    options: ConsistencyReadOptions = {}
+  ): Promise<Lobby | null> {
+    const expectedMinLedger = options.expectedMinLedger;
+    const maxAttempts = options.maxAttempts ?? this.consistencyMaxAttempts;
+    const delayMs = options.delayMs ?? this.consistencyDelayMs;
+    const server = new rpc.Server(RPC_URL);
+
+    let lastLatestLedger: number | undefined;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const [latest, lobby] = await Promise.all([
+        server.getLatestLedger().catch(() => null),
+        this.getLobby(sessionId),
+      ]);
+      lastLatestLedger = Number(latest?.sequence);
+      const staleRead = expectedMinLedger !== undefined
+        && Number.isFinite(lastLatestLedger)
+        && lastLatestLedger < expectedMinLedger;
+      if (!staleRead) {
+        return lobby;
+      }
+      if (DEAD_DROP_DEBUG) {
+        console.info('[DeadDropService][getLobbyWithConsistencyRetry] stale read retry', {
+          sessionId,
+          attempt,
+          maxAttempts,
+          latestLedger: lastLatestLedger,
+          expectedMinLedger,
+        });
+      }
+      if (attempt < maxAttempts) {
+        await this.sleep(delayMs);
+      }
+    }
+    throw new DeadDropServiceError(
+      'rpc_stale_read',
+      'RPC is lagging behind the latest lobby update. Please retry.',
+      { action: 'get_lobby', latestLedger: lastLatestLedger, expectedMinLedger }
+    );
   }
 
   async getLobby(sessionId: number): Promise<Lobby | null> {
@@ -503,20 +769,42 @@ export class DeadDropService {
     hostPoints: bigint,
     signer: MutationSigner
   ) {
-    const client = this.createSigningClient(hostAddress, this.toClientSigner(signer));
+    if (DEAD_DROP_DEBUG) {
+      console.info('[DeadDropService][open_game] Build start', {
+        sessionId,
+        hostAddress,
+        hostPoints: hostPoints.toString(),
+      });
+    }
+    const mutationPlan = this.planMutationClient(hostAddress, this.toClientSigner(signer));
+    const client = mutationPlan.client;
     const tx = await client.open_game({
       session_id: sessionId,
       host: hostAddress,
       host_points: hostPoints,
     }, DEFAULT_METHOD_OPTIONS);
+    if (DEAD_DROP_DEBUG) {
+      console.info('[DeadDropService][open_game] Build complete', {
+        sessionId,
+        hasSimulationAuth: Boolean((tx as any)?.simulationData?.result?.auth?.length),
+        operationCount: Array.isArray((tx as any)?.built?.operations) ? (tx as any).built.operations.length : undefined,
+      });
+    }
 
     const sentTx = await this.submitMutation(
       'open_game',
       tx as contract.AssembledTransaction<unknown>,
       signer,
       DEFAULT_AUTH_TTL_MINUTES,
-      false,
+      { bypassRelayer: mutationPlan.bypassRelayer }
     );
+    if (DEAD_DROP_DEBUG) {
+      console.info('[DeadDropService][open_game] Submit success', {
+        sessionId,
+        hash: (sentTx as any)?.getTransactionResponse?.hash,
+        status: (sentTx as any)?.getTransactionResponse?.status,
+      });
+    }
     this.ensureMutationSubmitted('open_game', sentTx);
     return sentTx;
   }
@@ -528,7 +816,21 @@ export class DeadDropService {
     randomness: DeadDropRandomnessArtifacts,
     signer: MutationSigner
   ) {
-    const client = this.createSigningClient(joinerAddress, this.toClientSigner(signer));
+    if (DEAD_DROP_DEBUG) {
+      console.info('[DeadDropService][join_game] Build start', {
+        sessionId,
+        joinerAddress,
+        joinerPoints: joinerPoints.toString(),
+        randomnessOutputLength: randomness.randomnessOutput.length,
+        dropCommitmentLength: randomness.dropCommitment.length,
+        randomnessSignatureLength: randomness.randomnessSignature.length,
+        randomnessOutputHex: randomness.randomnessOutput.toString('hex'),
+        dropCommitmentHex: randomness.dropCommitment.toString('hex'),
+        randomnessSignatureHex: randomness.randomnessSignature.toString('hex'),
+      });
+    }
+    const mutationPlan = this.planMutationClient(joinerAddress, this.toClientSigner(signer));
+    const client = mutationPlan.client;
     const tx = await client.join_game({
       session_id: sessionId,
       joiner: joinerAddress,
@@ -537,22 +839,55 @@ export class DeadDropService {
       drop_commitment: randomness.dropCommitment,
       randomness_signature: randomness.randomnessSignature,
     }, DEFAULT_METHOD_OPTIONS);
+    if (DEAD_DROP_DEBUG) {
+      console.info('[DeadDropService][join_game] Build complete', {
+        sessionId,
+        hasSimulationAuth: Boolean((tx as any)?.simulationData?.result?.auth?.length),
+        operationCount: Array.isArray((tx as any)?.built?.operations) ? (tx as any).built.operations.length : undefined,
+      });
+    }
 
     try {
+      if (DEAD_DROP_DEBUG) {
+        console.info('[DeadDropService][join_game] Submitting join_game', { sessionId, joinerAddress });
+      }
       const sentTx = await this.submitMutation(
         'join_game',
         tx as contract.AssembledTransaction<unknown>,
         signer,
         DEFAULT_AUTH_TTL_MINUTES,
-        false,
+        { bypassRelayer: mutationPlan.bypassRelayer }
       );
-      return sentTx.result;
+      if (DEAD_DROP_DEBUG) {
+        console.info('[DeadDropService][join_game] Submit success', {
+          sessionId,
+          status: (sentTx as any)?.getTransactionResponse?.status,
+          hash: (sentTx as any)?.getTransactionResponse?.hash,
+          ledger: (sentTx as any)?.getTransactionResponse?.ledger,
+        });
+      }
+      return sentTx;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (DEAD_DROP_DEBUG) {
+        console.error('[DeadDropService][join_game] Submit failed', {
+          sessionId,
+          joinerAddress,
+          error: err,
+          message: msg,
+        });
+      }
+      if (msg.includes('Error(Contract, #17)')) {
+        throw new DeadDropServiceError(
+          'randomness_verification_failed',
+          'Dead Drop randomness verification failed (Error #17). ' +
+          'Check prover output and deployed randomness verifier compatibility.',
+          { contractCode: 17, action: 'join_game' }
+        );
+      }
       if (
         msg.includes('MismatchingParameterLen')
         || msg.includes('UnexpectedSize')
-        || msg.includes('join_game')
       ) {
         throw new Error(
           'Dead Drop contract ABI mismatch: the deployed contract appears outdated. ' +
@@ -578,7 +913,8 @@ export class DeadDropService {
     publicInputs: Buffer[],
     signer: MutationSigner
   ): Promise<SubmitPingResult> {
-    const client = this.createSigningClient(playerAddress, this.toClientSigner(signer));
+    const mutationPlan = this.planMutationClient(playerAddress, this.toClientSigner(signer));
+    const client = mutationPlan.client;
     const tx = await client.submit_ping({
       session_id: sessionId,
       player: playerAddress,
@@ -596,22 +932,39 @@ export class DeadDropService {
         tx as contract.AssembledTransaction<unknown>,
         signer,
         DEFAULT_AUTH_TTL_MINUTES,
-        false,
+        { bypassRelayer: mutationPlan.bypassRelayer }
       );
       if (sentTx.getTransactionResponse?.status === 'FAILED') {
         throw new Error('Transaction failed');
       }
       const txHash = (sentTx as any)?.getTransactionResponse?.hash as string | undefined;
+      const ledger = (sentTx as any)?.getTransactionResponse?.ledger as number | undefined;
       return {
         result: sentTx.result,
         txHash,
+        ledger,
       };
     } catch (err) {
       if (err instanceof Error && err.message.includes('Error(Contract, #8)')) {
-        throw new Error(
+        throw new DeadDropServiceError(
+          'invalid_public_inputs',
           'Ping proof does not match current on-chain inputs (InvalidPublicInputs). ' +
-          'Refresh both players to sync state, then retry Send Ping.'
+          'Refresh both players to sync state, then retry Send Ping.',
+          { contractCode: 8, action: 'submit_ping' }
         );
+      }
+      if (err instanceof Error && err.message.includes('Error(Contract, #10)')) {
+        throw new DeadDropServiceError(
+          'proof_verification_failed',
+          'Proof verifier rejected the proof (ProofVerificationFailed). Check prover/verifier compatibility.',
+          { contractCode: 10, action: 'submit_ping' }
+        );
+      }
+      if (err instanceof Error && err.message.includes('Error(Contract, #6)')) {
+        throw new DeadDropServiceError('not_your_turn', 'It is no longer your turn.', { contractCode: 6, action: 'submit_ping' });
+      }
+      if (err instanceof Error && err.message.includes('Error(Contract, #7)')) {
+        throw new DeadDropServiceError('invalid_turn', 'Turn changed before submission.', { contractCode: 7, action: 'submit_ping' });
       }
       if (err instanceof Error && err.message.includes('Transaction failed!')) {
         throw new Error('Transaction failed - check turn order and proof validity');
@@ -693,6 +1046,7 @@ export class DeadDropService {
     return txHash.trim().replace(/^0x/i, '').toLowerCase();
   }
 
+
   async getSubmitPingProofFromTx(txHash: string): Promise<SubmitPingProofArtifacts | null> {
     const normalizedHash = this.normalizeTxHash(txHash);
     if (!/^[0-9a-f]{64}$/.test(normalizedHash)) {
@@ -746,73 +1100,29 @@ export class DeadDropService {
   }
 
   async getPingEvents(sessionId: number): Promise<PingEventRecord[]> {
+    // Use backend event indexer instead of polling RPC directly
+    // This eliminates all cursor management issues
+    const relayerUrl = DEAD_DROP_RELAYER_URL || 'http://localhost:8787';
+
     try {
-      const server = new rpc.Server(RPC_URL);
-      const latest = await server.getLatestLedger();
-      const cursor = this.pingEventsCursorBySession.get(sessionId);
-      const startLedger = cursor !== undefined
-        ? Math.max(1, cursor - this.pingEventsRewind)
-        : Math.max(1, latest.sequence - this.initialPingEventsBackfill);
-
-      // Fetch ALL contract events without topic filter — server-side topic
-      // filtering is unreliable on the public testnet RPC. Filter client-side.
-      const events = await server.getEvents({
-        startLedger,
-        filters: [{ type: 'contract', contractIds: [this.contractId] }],
-        limit: 200,
-      });
-
-      let maxLedgerSeen = startLedger;
-      for (const event of events.events) {
-        const ledger = Number((event as any).ledger);
-        if (Number.isFinite(ledger) && ledger > maxLedgerSeen) {
-          maxLedgerSeen = ledger;
-        }
-      }
-      const nextCursor = Math.max(
-        maxLedgerSeen + 1,
-        latest.sequence - this.pingEventsRewind
+      const response = await fetch(
+        `${relayerUrl}/events/ping?session_id=${sessionId}`
       );
-      this.pingEventsCursorBySession.set(sessionId, nextCursor);
 
-      // Pre-compute expected topic XDRs for client-side matching
-      const expectedSymbol = xdr.ScVal.scvSymbol("ping").toXDR('base64');
-      const expectedSessionId = xdr.ScVal.scvU32(sessionId).toXDR('base64');
-
-      const parsed: PingEventRecord[] = [];
-      for (const event of events.events) {
-        try {
-          const t = event.topic;
-          if (!t || t.length < 2) continue;
-          if (t[0].toXDR('base64') !== expectedSymbol || t[1].toXDR('base64') !== expectedSessionId) {
-            continue;
-          }
-
-          // event.value is already xdr.ScVal (not a base64 wrapper)
-          const val = event.value;
-          if (val.switch().name !== 'scvVec') continue;
-          const vec = val.vec();
-          if (!vec || vec.length < 5) continue;
-
-          const player = Address.fromScVal(vec[0]).toString();
-          const turn = vec[1].u32();
-          const distance = vec[2].u32();
-          const x = vec[3].u32();
-          const y = vec[4].u32();
-
-          const txHashRaw = (event as any).txHash;
-          const txHash = typeof txHashRaw === 'string' && txHashRaw ? txHashRaw : undefined;
-
-          parsed.push({ player, turn, distance, x, y, txHash });
-        } catch (e) {
-          console.error('Failed to parse ping event', e);
+      if (!response.ok) {
+        if (DEAD_DROP_DEBUG) {
+          console.warn('[DeadDropService][getPingEvents] Backend fetch failed:', response.statusText);
         }
+        return [];
       }
 
-      return parsed;
-    } catch (err) {
-      console.error('getPingEvents error:', err);
-      return [];
+      const { events } = await response.json();
+      return events || [];
+    } catch (error) {
+      if (DEAD_DROP_DEBUG) {
+        console.error('[DeadDropService][getPingEvents] Backend fetch error:', error);
+      }
+      return []; // Graceful degradation
     }
   }
 
@@ -821,7 +1131,8 @@ export class DeadDropService {
     playerAddress: string,
     signer: MutationSigner
   ) {
-    const client = this.createSigningClient(playerAddress, this.toClientSigner(signer));
+    const mutationPlan = this.planMutationClient(playerAddress, this.toClientSigner(signer));
+    const client = mutationPlan.client;
     const tx = await client.force_timeout({
       session_id: sessionId,
       player: playerAddress,
@@ -832,7 +1143,7 @@ export class DeadDropService {
       tx as contract.AssembledTransaction<unknown>,
       signer,
       DEFAULT_AUTH_TTL_MINUTES,
-      false,
+      { bypassRelayer: mutationPlan.bypassRelayer }
     );
     return sentTx.result;
   }

@@ -5,12 +5,15 @@
 import { Address, authorizeEntry, contract, rpc, xdr } from '@stellar/stellar-sdk';
 import { Buffer } from 'buffer';
 import { DEAD_DROP_RELAYER_URL, RPC_URL } from './constants';
+const DEAD_DROP_DEBUG = import.meta.env.DEV || import.meta.env.VITE_DEAD_DROP_DEBUG === 'true';
 
 interface RelayerSubmitResponse {
   hash: string;
   status: string;
   ledger?: number | null;
   return_value_xdr?: string | null;
+  errorResultXdr?: string | null;
+  latestLedger?: number | null;
 }
 
 type WalletSignResult = {
@@ -28,6 +31,30 @@ type RelayerSignerOptions = {
   signAuthEntry?: SignAuthEntryCallback;
   signAssembledTransaction?: (tx: contract.AssembledTransaction<unknown>) => Promise<void>;
 };
+
+const TX_BAD_SEQ_RESULT_CODE = -5;
+
+function decodeTxResultCodeFromXdr(errorResultXdr?: string | null): number | null {
+  if (!errorResultXdr) return null;
+  try {
+    const raw = Buffer.from(errorResultXdr, 'base64');
+    // TransactionResult XDR starts with:
+    // feeCharged: i64 (8 bytes), result discriminant: i32 (4 bytes)
+    if (raw.length < 12) return null;
+    return raw.readInt32BE(8);
+  } catch {
+    return null;
+  }
+}
+
+function isTxBadSeqFromRelayerPayload(payload: RelayerSubmitResponse): boolean {
+  return decodeTxResultCodeFromXdr(payload.errorResultXdr) === TX_BAD_SEQ_RESULT_CODE;
+}
+
+function isTxBadSeqError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('txBAD_SEQ') || message.includes('bad sequence');
+}
 
 function parseSignedEntryXdr(
   signedAuthEntry: string,
@@ -211,6 +238,49 @@ function resolveRelayerFuncPayload(op: any): string {
   throw new Error('Could not encode invokeHostFunction payload for relayer submission.');
 }
 
+function tryExtractInvokeFunctionName(op: any): string | null {
+  try {
+    if (op?.func && typeof op.func.switch === 'function') {
+      const hostFnType = op.func.switch().name;
+      if (hostFnType === 'hostFunctionTypeInvokeContract') {
+        const invokeContract = op.func.invokeContract();
+        const rawName = invokeContract.functionName();
+        return typeof rawName === 'string' ? rawName : Buffer.from(rawName).toString('utf-8');
+      }
+    }
+  } catch {
+    // best effort only
+  }
+  return null;
+}
+
+function summarizeAuthCredentialTypes(entries: any[]): {
+  sourceAccount: number;
+  address: number;
+  other: number;
+} {
+  let sourceAccount = 0;
+  let address = 0;
+  let other = 0;
+
+  for (const entry of entries) {
+    try {
+      const credSwitch = entry?.credentials?.().switch().name;
+      if (credSwitch === 'sorobanCredentialsSourceAccount') {
+        sourceAccount += 1;
+      } else if (credSwitch === 'sorobanCredentialsAddress') {
+        address += 1;
+      } else {
+        other += 1;
+      }
+    } catch {
+      other += 1;
+    }
+  }
+
+  return { sourceAccount, address, other };
+}
+
 async function submitViaRelayer(
   tx: contract.AssembledTransaction<any>,
   signer?: RelayerSignerOptions,
@@ -226,8 +296,18 @@ async function submitViaRelayer(
     hasBuiltTx && hasSimulationAuth
       ? tx
       : await tx.simulate();
+  if (DEAD_DROP_DEBUG) {
+    console.info('[TxHelper][relayer] Prepared tx', {
+      reusedPreparedTx: hasBuiltTx && hasSimulationAuth,
+      hasBuiltAfterPrepare: Boolean((prepared as any)?.built),
+      hasSimulationAuth: Boolean((prepared as any)?.simulationData?.result?.auth?.length),
+    });
+  }
 
   if (typeof signer?.signAssembledTransaction === 'function') {
+    if (DEAD_DROP_DEBUG) {
+      console.info('[TxHelper][relayer] Running signAssembledTransaction hook');
+    }
     await signer.signAssembledTransaction(prepared as contract.AssembledTransaction<unknown>);
   }
 
@@ -246,32 +326,83 @@ async function submitViaRelayer(
     throw new Error('Relayer submission requires invokeHostFunction operation');
   }
 
-  // Guard rail: never submit unsigned smart-account auth entries to relayer.
+  // Filter auth entries for relayer submission:
+  // 1. Remove source account credentials (relayer manages source account)
+  // 2. Validate no unsigned smart-account entries
+  const originalAuthEntries = Array.isArray(op.auth) ? op.auth : [];
+  const authSummaryBefore = summarizeAuthCredentialTypes(originalAuthEntries);
+  if (DEAD_DROP_DEBUG) {
+    console.info('[TxHelper][relayer] Auth credential breakdown before filtering', authSummaryBefore);
+  }
+  let filteredAuthEntries: any[] = [];
   if (Array.isArray(op.auth)) {
     for (const entry of op.auth) {
       try {
-        if (!entry || entry.credentials().switch().name !== 'sorobanCredentialsAddress') {
+        const credSwitch = entry.credentials().switch().name;
+
+        // Skip source account credentials - relayer will add its own
+        if (credSwitch === 'sorobanCredentialsSourceAccount') {
+          if (DEAD_DROP_DEBUG) {
+            console.info('[TxHelper][relayer] Filtering out source account credential (relayer will provide)');
+          }
           continue;
         }
+
+        // Only address credentials are allowed
+        if (credSwitch !== 'sorobanCredentialsAddress') {
+          if (DEAD_DROP_DEBUG) {
+            console.warn('[TxHelper][relayer] Unknown credential type:', credSwitch);
+          }
+          continue;
+        }
+
         const creds = entry.credentials().address();
         const authAddress = Address.fromScAddress(creds.address()).toString();
+
+        // Validate smart accounts are signed
         if (authAddress.startsWith('C') && creds.signature().switch().name === 'scvVoid') {
           throw new Error(`Unsigned smart-account auth entry detected for ${authAddress}. Passkey signing did not run.`);
         }
+
+        filteredAuthEntries.push(entry);
       } catch (err) {
         if (err instanceof Error) throw err;
         throw new Error('Failed to validate auth entries before relayer submission.');
       }
     }
   }
+  if (
+    filteredAuthEntries.length === 0 &&
+    authSummaryBefore.sourceAccount > 0 &&
+    authSummaryBefore.address === 0
+  ) {
+    throw new Error(
+      'Relayer submission is incompatible with source-account-only Soroban auth for this transaction. Build/simulate the transaction with a neutral simulation source so the user authorization appears as an address auth entry.'
+    );
+  }
+  if (DEAD_DROP_DEBUG) {
+    console.info('[TxHelper][relayer] Auth credential breakdown after filtering', {
+      ...summarizeAuthCredentialTypes(filteredAuthEntries),
+      kept: filteredAuthEntries.length,
+    });
+  }
 
   const endpoint = options?.direct ? '/tx/submit-direct' : '/tx/submit';
+  if (DEAD_DROP_DEBUG) {
+    console.info('[TxHelper][relayer] Submitting', {
+      endpoint,
+      functionName: tryExtractInvokeFunctionName(op),
+      totalAuthEntries: Array.isArray(op.auth) ? op.auth.length : 0,
+      filteredAuthEntries: filteredAuthEntries.length,
+      rpcUrl: RPC_URL,
+    });
+  }
   const response = await fetch(`${normalizeRelayerBaseUrl(DEAD_DROP_RELAYER_URL)}${endpoint}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       func_xdr: resolveRelayerFuncPayload(op),
-      auth_entries_xdr: Array.isArray(op.auth) ? op.auth.map((entry: any) => entry.toXDR('base64')) : [],
+      auth_entries_xdr: filteredAuthEntries.map((entry: any) => entry.toXDR('base64')),
       rpc_url: RPC_URL,
     }),
   });
@@ -285,11 +416,26 @@ async function submitViaRelayer(
   }
 
   const payload = (await response.json()) as RelayerSubmitResponse;
+  if (DEAD_DROP_DEBUG) {
+    console.info('[TxHelper][relayer] Response payload', {
+      status: payload?.status,
+      hash: payload?.hash,
+      ledger: payload?.ledger,
+      latestLedger: payload?.latestLedger,
+      hasErrorResultXdr: Boolean(payload?.errorResultXdr),
+    });
+  }
   if (!payload || typeof payload.hash !== 'string' || !payload.hash) {
     throw new Error('Relayer response missing transaction hash');
   }
 
   if (payload.status !== 'SUCCESS') {
+    if (isTxBadSeqFromRelayerPayload(payload)) {
+      throw new Error(
+        `txBAD_SEQ: stale transaction sequence during relayer submission` +
+        (typeof payload.latestLedger === 'number' ? ` (latestLedger=${payload.latestLedger})` : '')
+      );
+    }
     throw new Error(`Transaction failed via relayer (status: ${payload.status || 'UNKNOWN'})`);
   }
 
@@ -324,14 +470,53 @@ export async function signAndSendViaLaunchtube(
   timeoutInSeconds: number = 30,
   signer?: RelayerSignerOptions,
   validUntilLedgerSeq?: number,
-  options?: { direct?: boolean }
+  options?: { direct?: boolean; bypassRelayer?: boolean }
 ): Promise<contract.SentTransaction<any>> {
-  if (typeof tx !== 'string' && 'simulate' in tx && DEAD_DROP_RELAYER_URL) {
-    return submitViaRelayer(tx, signer, validUntilLedgerSeq, options);
+  if (
+    typeof tx !== 'string' &&
+    'simulate' in tx &&
+    DEAD_DROP_RELAYER_URL &&
+    options?.bypassRelayer !== true
+  ) {
+    if (DEAD_DROP_DEBUG) {
+      console.info('[TxHelper][submit] Using relayer path', {
+        timeoutInSeconds,
+        hasValidUntilLedgerSeq: typeof validUntilLedgerSeq === 'number',
+        direct: options?.direct === true,
+        bypassRelayer: Boolean(options?.bypassRelayer),
+      });
+    }
+    try {
+      return await submitViaRelayer(tx, signer, validUntilLedgerSeq, options);
+    } catch (error) {
+      if (DEAD_DROP_DEBUG) {
+        console.warn('[TxHelper][submit] Relayer submit failed', { error });
+      }
+      if (!isTxBadSeqError(error)) throw error;
+
+      // Retry once with a fresh simulation/build to refresh source account sequence.
+      if (DEAD_DROP_DEBUG) {
+        console.warn('[TxHelper][submit] Retrying after txBAD_SEQ with fresh simulation');
+      }
+      const refreshed = await tx.simulate();
+      const retried = await submitViaRelayer(refreshed, signer, validUntilLedgerSeq, options);
+      if (DEAD_DROP_DEBUG) {
+        console.info('[TxHelper][submit] Retry after txBAD_SEQ succeeded', {
+          status: (retried as any)?.getTransactionResponse?.status,
+          hash: (retried as any)?.getTransactionResponse?.hash,
+        });
+      }
+      return retried;
+    }
   }
 
   // If tx is an AssembledTransaction, simulate and send
   if (typeof tx !== 'string' && 'simulate' in tx) {
+    if (DEAD_DROP_DEBUG) {
+      console.info('[TxHelper][submit] Using direct SDK signAndSend path', {
+        bypassRelayer: options?.bypassRelayer === true,
+      });
+    }
     const simulated = await tx.simulate();
     try {
       return await simulated.signAndSend();

@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { createServer } = require("./server");
+const { selfCheckProverArtifacts } = require("./prover");
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -27,12 +28,27 @@ function loadEnvFile(filePath) {
 
 loadEnvFile(path.resolve(__dirname, "../../.env"));
 
-const port = Number(process.env.PORT || 8787);
-const server = createServer();
+async function start() {
+  const strictSelfCheck = process.env.DEAD_DROP_PROVER_SKIP_SELF_CHECK !== "1";
+  if (strictSelfCheck) {
+    await selfCheckProverArtifacts();
+  } else {
+    console.warn("[prover] Skipping startup artifact self-check (DEAD_DROP_PROVER_SKIP_SELF_CHECK=1)");
+  }
 
-server.listen(port, () => {
-  console.log(`dead-drop backend listening on http://localhost:${port}`);
-  console.log(
-    "Endpoints: GET /, POST /randomness/session, POST /prove/ping, POST /tx/submit, POST /tx/submit-direct, POST /relay/ping/request, GET /relay/ping/next, POST /relay/ping/respond, GET /relay/ping/result, WS /relay/webrtc"
-  );
+  const port = Number(process.env.PORT || 8787);
+  const server = createServer();
+
+  server.listen(port, () => {
+    console.log(`dead-drop backend listening on http://localhost:${port}`);
+    console.log(
+      "Endpoints: GET /, POST /randomness/session, POST /prove/ping, POST /tx/submit, POST /tx/submit-direct, POST /relay/ping/request, GET /relay/ping/next, POST /relay/ping/respond, GET /relay/ping/result, GET /events/ping, WS /relay/webrtc"
+    );
+  });
+}
+
+start().catch((err) => {
+  const message = err instanceof Error ? err.stack || err.message : String(err);
+  console.error("[prover] Startup failed:", message);
+  process.exit(1);
 });

@@ -86,18 +86,6 @@ export const DEAD_DROP_PING_IMAGE_ID =
   runtimeConfig?.deadDropPingImageId ||
   import.meta.env.VITE_DEAD_DROP_PING_IMAGE_ID ||
   '';
-export const SMART_ACCOUNT_WASM_HASH =
-  runtimeConfig?.smartAccountWasmHash ||
-  import.meta.env.VITE_SMART_ACCOUNT_WASM_HASH ||
-  '';
-export const SMART_ACCOUNT_WEBAUTHN_VERIFIER_ADDRESS =
-  runtimeConfig?.smartAccountWebauthnVerifierAddress ||
-  import.meta.env.VITE_SMART_ACCOUNT_WEBAUTHN_VERIFIER_ADDRESS ||
-  '';
-export const SMART_ACCOUNT_RP_NAME =
-  runtimeConfig?.smartAccountRpName ||
-  import.meta.env.VITE_SMART_ACCOUNT_RP_NAME ||
-  'Dead Drop';
 
 // Transaction options
 export const DEFAULT_METHOD_OPTIONS = {

@@ -3,17 +3,12 @@ import { create } from 'zustand';
 export type WalletOperation =
   | 'idle'
   | 'connect-wallet'
-  | 'connect-passkey'
-  | 'create-passkey'
   | 'switch-dev';
 
 export type WalletStage =
   | 'idle'
   | 'validating'
   | 'opening_wallet'
-  | 'opening_passkey_prompt'
-  | 'creating_passkey'
-  | 'deploying_account'
   | 'finalizing'
   | 'done'
   | 'error';
@@ -22,7 +17,7 @@ export interface WalletState {
   // Wallet connection
   publicKey: string | null;
   walletId: string | null; // ID of the connected wallet
-  walletType: 'dev' | 'wallet' | 'smart-account' | null;
+  walletType: 'dev' | 'wallet' | null;
   isConnected: boolean;
   isConnecting: boolean;
 
@@ -37,7 +32,7 @@ export interface WalletState {
   walletStageMessage: string | null;
 
   // Actions
-  setWallet: (publicKey: string, walletId: string, walletType: 'dev' | 'wallet' | 'smart-account') => void;
+  setWallet: (publicKey: string, walletId: string, walletType: 'dev' | 'wallet') => void;
   setPublicKey: (publicKey: string) => void;
   setConnected: (connected: boolean) => void;
   setConnecting: (connecting: boolean) => void;

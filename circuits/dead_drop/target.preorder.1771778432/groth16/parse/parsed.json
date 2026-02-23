@@ -1,0 +1,9 @@
+{
+  "opcode_count": 59,
+  "witness_count": 47,
+  "opcode_variants": [
+    "AssertZero",
+    "BlackBoxFuncCall",
+    "BrilligCall"
+  ]
+}

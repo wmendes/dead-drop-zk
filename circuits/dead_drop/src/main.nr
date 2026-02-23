@@ -28,11 +28,6 @@ fn wrapped_diff(a: u32, b: u32) -> u32 {
 /// Public inputs (verified on-chain):
 ///   session_id, turn, ping_x, ping_y, expected_commitment, expected_distance
 fn main(
-    // Private inputs (kept server-side by prover)
-    drop_x: u32,
-    drop_y: u32,
-    drop_salt: Field,
-
     // Public inputs (verified on-chain)
     session_id: pub u32,
     turn: pub u32,
@@ -40,6 +35,11 @@ fn main(
     ping_y: pub u32,
     expected_commitment: pub Field,
     expected_distance: pub u32,
+
+    // Private inputs (kept server-side by prover)
+    drop_x: u32,
+    drop_y: u32,
+    drop_salt: Field,
 ) {
     // Keep session/turn anchored in the proof transcript.
     let _ = session_id;
@@ -61,7 +61,7 @@ fn main(
 fn test_distance_zero_exact_match() {
     let drop_salt: Field = 0x1111;
     let commitment = poseidon2_hash_3([42 as Field, 17 as Field, drop_salt]);
-    main(42, 17, drop_salt, 1, 0, 42, 17, commitment, 0);
+    main(1, 0, 42, 17, commitment, 0, 42, 17, drop_salt);
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn test_distance_nonzero() {
     // dx=min(8,92)=8, dy=min(23,77)=23 => 31
     let drop_salt: Field = 0xaaaa;
     let commitment = poseidon2_hash_3([42 as Field, 73 as Field, drop_salt]);
-    main(42, 73, drop_salt, 1, 0, 50, 50, commitment, 31);
+    main(1, 0, 50, 50, commitment, 31, 42, 73, drop_salt);
 }
 
 #[test]
@@ -79,5 +79,5 @@ fn test_distance_wrap() {
     // dx=min(98,2)=2, dy=min(98,2)=2 => 4
     let drop_salt: Field = 0xdead;
     let commitment = poseidon2_hash_3([99 as Field, 99 as Field, drop_salt]);
-    main(99, 99, drop_salt, 7, 3, 1, 1, commitment, 4);
+    main(7, 3, 1, 1, commitment, 4, 99, 99, drop_salt);
 }

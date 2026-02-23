@@ -1,0 +1,11 @@
+{
+  "drop_x": "42",
+  "drop_y": "17",
+  "drop_salt": "0x1111",
+  "session_id": "1",
+  "turn": "1",
+  "ping_x": "42",
+  "ping_y": "17",
+  "expected_commitment": "0x0e7ae8f83e3b6f4cf943d25495f8293a5a6e0b0ac6bbfa07ce79fbf84e5e8c2f",
+  "expected_distance": "0"
+}

@@ -18,6 +18,8 @@ export interface ProvePingResponse {
   publicInputsHex: string[];
 }
 
+const DEAD_DROP_DEBUG = import.meta.env.DEV || import.meta.env.VITE_DEAD_DROP_DEBUG === 'true';
+
 async function readProofServiceError(response: Response): Promise<string> {
   const fallback = `Proof service failed (${response.status})`;
   const raw = await response.text().catch(() => '');
@@ -54,11 +56,25 @@ export async function getSessionRandomness(
   sessionId: number,
 ): Promise<SessionRandomnessArtifacts> {
   const normalizedProverUrl = proverUrl.replace(/\/$/, '');
+  if (DEAD_DROP_DEBUG) {
+    console.info('[DeadDropProof][randomness] Request start', {
+      proverUrl: normalizedProverUrl,
+      sessionId,
+    });
+  }
   const response = await fetch(`${normalizedProverUrl}/randomness/session`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session_id: sessionId }),
   });
+
+  if (DEAD_DROP_DEBUG) {
+    console.info('[DeadDropProof][randomness] Response received', {
+      status: response.status,
+      ok: response.ok,
+      sessionId,
+    });
+  }
 
   if (!response.ok) {
     throw new Error(await readProofServiceError(response));
@@ -69,13 +85,27 @@ export async function getSessionRandomness(
   if (!Number.isInteger(parsedSessionId) || parsedSessionId !== sessionId) {
     throw new Error('Proof service returned unexpected session_id');
   }
-
-  return {
+  const artifacts = {
     sessionId: parsedSessionId,
     randomnessOutputHex: ensureHex(data.randomness_output_hex, 'randomness_output_hex', 32),
     randomnessSignatureHex: ensureHex(data.randomness_signature_hex, 'randomness_signature_hex', 64),
     dropCommitmentHex: ensureHex(data.drop_commitment_hex, 'drop_commitment_hex', 32),
   };
+
+  if (DEAD_DROP_DEBUG) {
+    console.info('[DeadDropProof][randomness] Parsed artifacts', {
+      requestedSessionId: sessionId,
+      returnedSessionId: artifacts.sessionId,
+      randomnessOutputHexLength: artifacts.randomnessOutputHex.length,
+      dropCommitmentHexLength: artifacts.dropCommitmentHex.length,
+      randomnessSignatureHexLength: artifacts.randomnessSignatureHex.length,
+      randomnessOutputHex: artifacts.randomnessOutputHex,
+      dropCommitmentHex: artifacts.dropCommitmentHex,
+      randomnessSignatureHex: artifacts.randomnessSignatureHex,
+    });
+  }
+
+  return artifacts;
 }
 
 export async function provePing(

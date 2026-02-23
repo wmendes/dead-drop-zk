@@ -124,7 +124,7 @@ export function Layout({ title, subtitle, children }: LayoutProps) {
                 {copiedAddress ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
               </span>
             )}
-            <span className="wallet-chip-type">{walletType === 'smart-account' ? 'Passkey' : walletType === 'wallet' ? 'Wallet' : 'Guest'}</span>
+            <span className="wallet-chip-type">{walletType === 'dev' ? 'Dev' : walletType === 'wallet' ? 'Wallet' : 'Guest'}</span>
           </button>
 
           {isConnected && (

@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import * as Tone from 'tone';
 import { zoneFrequency, zonePingPattern, type TemperatureZone } from './temperatureZones';
 
+const SOUND_DEBUG = import.meta.env.DEV || import.meta.env.VITE_DEAD_DROP_DEBUG === 'true';
+
 export function useSoundEngine() {
   const [enabled, setEnabled] = useState(false);
   const reverbRef = useRef<Tone.Reverb | null>(null);
@@ -9,55 +11,60 @@ export function useSoundEngine() {
   const ambientSynthRef = useRef<Tone.Synth | null>(null);
   const bassDroneRef = useRef<Tone.Synth | null>(null);
 
-  // Initialize Tone audio context and effects on mount
   useEffect(() => {
-    const setupAudio = async () => {
-      if (!reverbRef.current) {
-        // Create reverb effect
-        const reverb = new Tone.Reverb({
-          decay: 6,
-          wet: 0.7,
-        }).toDestination();
-        reverbRef.current = reverb;
-
-        // Create ambient synth (triangle wave)
-        const ambientSynth = new Tone.Synth({
-          oscillator: { type: 'triangle' },
-          envelope: {
-            attack: 0.1,
-            decay: 0.2,
-            sustain: 0.3,
-            release: 0.5,
-          },
-        }).connect(reverb);
-        ambientSynthRef.current = ambientSynth;
-
-        // Create bass drone synth (sawtooth wave)
-        const bassDrone = new Tone.Synth({
-          oscillator: { type: 'sawtooth' },
-          envelope: {
-            attack: 2,
-            decay: 1,
-            sustain: 0.5,
-            release: 2,
-          },
-        }).connect(reverb);
-        bassDrone.volume.value = -25;
-        bassDroneRef.current = bassDrone;
-      }
-    };
-
-    setupAudio();
-
     return () => {
-      // Cleanup
+      ambientSequenceRef.current?.dispose();
+      ambientSequenceRef.current = null;
+      ambientSynthRef.current?.dispose();
+      ambientSynthRef.current = null;
+      bassDroneRef.current?.dispose();
+      bassDroneRef.current = null;
+      reverbRef.current?.dispose();
+      reverbRef.current = null;
     };
   }, []);
+
+  const ensureAudioGraphInitialized = async () => {
+    if (reverbRef.current && ambientSynthRef.current && bassDroneRef.current) return;
+    if (SOUND_DEBUG) {
+      console.info('[DeadDropSound] Initializing audio graph after user gesture');
+    }
+
+    const reverb = new Tone.Reverb({
+      decay: 6,
+      wet: 0.7,
+    }).toDestination();
+    reverbRef.current = reverb;
+
+    const ambientSynth = new Tone.Synth({
+      oscillator: { type: 'triangle' },
+      envelope: {
+        attack: 0.1,
+        decay: 0.2,
+        sustain: 0.3,
+        release: 0.5,
+      },
+    }).connect(reverb);
+    ambientSynthRef.current = ambientSynth;
+
+    const bassDrone = new Tone.Synth({
+      oscillator: { type: 'sawtooth' },
+      envelope: {
+        attack: 2,
+        decay: 1,
+        sustain: 0.5,
+        release: 2,
+      },
+    }).connect(reverb);
+    bassDrone.volume.value = -25;
+    bassDroneRef.current = bassDrone;
+  };
 
   const ensureAudioStarted = async () => {
     if (Tone.Synth.getDefaults().context.state === 'suspended') {
       await Tone.start();
     }
+    await ensureAudioGraphInitialized();
   };
 
   const playPingResult = async (zone: TemperatureZone) => {
@@ -285,13 +292,15 @@ export function useSoundEngine() {
   const startAmbient = async (force = false) => {
     if ((!enabled && !force) || ambientSequenceRef.current) return;
     await ensureAudioStarted();
+    if (!ambientSynthRef.current || !bassDroneRef.current) return;
 
     // Bass drone
     bassDroneRef.current?.triggerAttack('A1', Tone.now());
 
     // Ambient arpeggio sequence
     const notes = ['A2', 'C3', 'E3', 'G3', 'A3', null, null, null]; // 50% sparse
-    const synth = ambientSynthRef.current!;
+    const synth = ambientSynthRef.current;
+    if (!synth) return;
 
     const sequence = new Tone.Sequence(
       (time, note) => {

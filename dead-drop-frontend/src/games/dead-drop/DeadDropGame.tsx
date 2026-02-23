@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, startTransition } from 'react';
 import { Buffer } from 'buffer';
 import {
   Loader2,
@@ -16,7 +16,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-import { DeadDropService, type PingEventRecord } from './deadDropService';
+import { DeadDropService, DeadDropServiceError, type PingEventRecord } from './deadDropService';
 import { useWallet } from '@/hooks/useWallet';
 import { DEAD_DROP_CONTRACT, DEAD_DROP_PROVER_URL, NETWORK } from '@/utils/constants';
 import type { Game } from './bindings';
@@ -32,6 +32,11 @@ import { distanceToZone, zoneLabel, zoneTextClass, type TemperatureZone } from '
 
 const MAX_TURNS = 30;
 const MODAL_PAGE_SIZE = 4;
+const DEAD_DROP_DEBUG = import.meta.env.DEV || import.meta.env.VITE_DEAD_DROP_DEBUG === 'true';
+const WAITING_LOBBY_READ_GRACE_MS = 10_000;
+const WAITING_LOBBY_MAX_CONSECUTIVE_MISSES = 3;
+const ACTIVE_GAME_READ_GRACE_MS = 12_000;
+const ACTIVE_GAME_MAX_CONSECUTIVE_MISSES = 3;
 
 type GamePhase = 'create' | 'waiting_opponent' | 'my_turn' | 'opponent_turn' | 'game_over';
 type ProofStatus = 'verified_onchain' | 'pending' | 'failed';
@@ -74,6 +79,12 @@ interface DeadDropGameProps {
 }
 
 const deadDropService = new DeadDropService(DEAD_DROP_CONTRACT);
+
+// TEMPORARY: Expose service for Phase 1 testing (remove after testing complete)
+if (DEAD_DROP_DEBUG) {
+  (window as any).__deadDropService = deadDropService;
+  console.info('[DeadDropGame] Service exposed to window.__deadDropService for testing');
+}
 
 const createRandomSessionId = (): number => {
   const buffer = new Uint32Array(1);
@@ -149,7 +160,7 @@ export function DeadDropGame({
 }: DeadDropGameProps) {
   const DEFAULT_POINTS = '1';
   const POINTS_DECIMALS = 7;
-  const { getContractSigner, releaseDeadDropSessionSigner } = useWallet();
+  const { getContractSigner } = useWallet();
   const sound = useSoundEngine();
 
   const [sessionId, setSessionId] = useState<number>(() => createRandomSessionId());
@@ -179,8 +190,19 @@ export function DeadDropGame({
   const actionLock = useRef(false);
   const missingSessionNotified = useRef(false);
   const gamePhaseRef = useRef<GamePhase>('create');
+  const waitingLobbyMissCountRef = useRef(0);
+  const waitingLobbyGraceUntilMsRef = useRef(0);
+  const activeGameMissCountRef = useRef(0);
+  const activeGameGraceUntilMsRef = useRef(0);
+  const expectedBackendMinLedgerRef = useRef<number | null>(null);
+  const lastAppliedBackendLedgerRef = useRef<number | null>(null);
+  const lastAppliedGameTurnRef = useRef<number | null>(null);
+  const lastAppliedWhoseTurnRef = useRef<number | null>(null);
   const proofHydrationInFlightRef = useRef<Set<string>>(new Set());
+  const inFlightMutationKeysRef = useRef<Set<string>>(new Set());
   const unmountedRef = useRef(false);
+  const pollInFlightRef = useRef(false);
+  const lastPingCountRef = useRef(0);
 
   const showToast = (message: string, type: 'error' | 'success' | 'info', duration?: number) => {
     setToast({ message, type, id: crypto.randomUUID(), duration });
@@ -211,6 +233,50 @@ export function DeadDropGame({
       actionLock.current = false;
     }
   };
+
+  const tryBeginMutation = useCallback((key: string): boolean => {
+    const set = inFlightMutationKeysRef.current;
+    if (set.has(key)) return false;
+    set.add(key);
+    return true;
+  }, []);
+
+  const endMutation = useCallback((key: string) => {
+    inFlightMutationKeysRef.current.delete(key);
+  }, []);
+
+  const resetWaitingLobbyReadTracking = useCallback(() => {
+    waitingLobbyMissCountRef.current = 0;
+    waitingLobbyGraceUntilMsRef.current = 0;
+  }, []);
+
+  const armWaitingLobbyReadGrace = useCallback(() => {
+    waitingLobbyMissCountRef.current = 0;
+    waitingLobbyGraceUntilMsRef.current = Date.now() + WAITING_LOBBY_READ_GRACE_MS;
+  }, []);
+
+  const resetActiveGameReadTracking = useCallback(() => {
+    activeGameMissCountRef.current = 0;
+    activeGameGraceUntilMsRef.current = 0;
+    expectedBackendMinLedgerRef.current = null;
+    lastAppliedBackendLedgerRef.current = null;
+    lastAppliedGameTurnRef.current = null;
+    lastAppliedWhoseTurnRef.current = null;
+  }, []);
+
+  const armActiveGameReadGrace = useCallback((expectedMinLedger?: number) => {
+    activeGameMissCountRef.current = 0;
+    activeGameGraceUntilMsRef.current = Date.now() + ACTIVE_GAME_READ_GRACE_MS;
+    if (typeof expectedMinLedger === 'number' && Number.isFinite(expectedMinLedger)) {
+      const rounded = Math.floor(expectedMinLedger);
+      if (rounded > 0) {
+        expectedBackendMinLedgerRef.current = Math.max(
+          expectedBackendMinLedgerRef.current ?? 0,
+          rounded,
+        );
+      }
+    }
+  }, []);
 
   const derivePhase = useCallback((game: Game | null): GamePhase => {
     if (!game) return 'create';
@@ -293,6 +359,8 @@ export function DeadDropGame({
   }, []);
 
   const resetMissingSessionState = useCallback(() => {
+    resetWaitingLobbyReadTracking();
+    resetActiveGameReadTracking();
     setGameState(null);
     setPingHistory([]);
     setExpandedProofTurn(null);
@@ -300,61 +368,217 @@ export function DeadDropGame({
     setStatusMessage(null);
     setLoading(false);
     setGamePhase('create');
-  }, []);
+  }, [resetWaitingLobbyReadTracking, resetActiveGameReadTracking]);
 
   const syncFromChain = useCallback(async (reason: string) => {
-    const [game, events] = await Promise.all([
-      deadDropService.getGame(sessionId),
-      deadDropService.getPingEvents(sessionId).catch(() => []),
-    ]);
+    if (pollInFlightRef.current) {
+      if (DEAD_DROP_DEBUG) {
+        console.debug('[DeadDropGame] Skipping sync - previous still in flight', { reason });
+      }
+      return;
+    }
+    pollInFlightRef.current = true;
 
-    if (!game) {
-      if (gamePhaseRef.current === 'waiting_opponent') {
-        const lobby = await deadDropService.getLobby(sessionId).catch(() => null);
-        if (lobby) {
-          missingSessionNotified.current = false;
+    try {
+      // MIGRATED: Use backend API instead of direct RPC calls
+      // Backend provides stable RPC connection, caching, and merged game+events response
+      const { game, events, ledger } = await deadDropService.getGameStateFromBackend(sessionId);
+
+      if (!game) {
+        if (gamePhaseRef.current === 'waiting_opponent') {
+          const lobby = await deadDropService.getLobby(sessionId).catch(() => null);
+          if (lobby) {
+            armWaitingLobbyReadGrace();
+            missingSessionNotified.current = false;
+            return;
+          }
+          waitingLobbyMissCountRef.current += 1;
+          const now = Date.now();
+          const withinGrace = now <= waitingLobbyGraceUntilMsRef.current;
+          const belowMissThreshold = waitingLobbyMissCountRef.current < WAITING_LOBBY_MAX_CONSECUTIVE_MISSES;
+          if (withinGrace || belowMissThreshold) {
+            if (DEAD_DROP_DEBUG) {
+              console.info('[DeadDropUI][sync] Waiting lobby read miss tolerated', {
+                sessionId,
+                missCount: waitingLobbyMissCountRef.current,
+                graceRemainingMs: Math.max(0, waitingLobbyGraceUntilMsRef.current - now),
+                reason,
+              });
+            }
+            return;
+          }
+          if (!missingSessionNotified.current) {
+            showToast('Lobby expired or game not found. Returning to setup.', 'info', 2500);
+            missingSessionNotified.current = true;
+          }
+          resetMissingSessionState();
           return;
         }
+
+        const isActivePhase =
+          gamePhaseRef.current === 'my_turn'
+          || gamePhaseRef.current === 'opponent_turn'
+          || gamePhaseRef.current === 'game_over';
+        if (isActivePhase) {
+          activeGameMissCountRef.current += 1;
+          const now = Date.now();
+          const backendLedger = typeof ledger === 'number' && Number.isFinite(ledger) ? ledger : null;
+          const expectedMinLedger = expectedBackendMinLedgerRef.current;
+          const backendBelowExpected = (
+            typeof expectedMinLedger === 'number'
+            && Number.isFinite(expectedMinLedger)
+            && backendLedger !== null
+            && backendLedger < expectedMinLedger
+          );
+          const withinGrace = now <= activeGameGraceUntilMsRef.current;
+          const belowMissThreshold = activeGameMissCountRef.current < ACTIVE_GAME_MAX_CONSECUTIVE_MISSES;
+          if (backendBelowExpected || withinGrace || belowMissThreshold) {
+            if (DEAD_DROP_DEBUG) {
+              console.info('[DeadDropUI][sync] Active game read miss tolerated', {
+                sessionId,
+                reason,
+                phase: gamePhaseRef.current,
+                missCount: activeGameMissCountRef.current,
+                graceRemainingMs: Math.max(0, activeGameGraceUntilMsRef.current - now),
+                backendLedger,
+                expectedMinLedger,
+                backendBelowExpected,
+              });
+            }
+            return;
+          }
+        }
+
         if (!missingSessionNotified.current) {
-          showToast('Lobby expired or game not found. Returning to setup.', 'info', 2500);
+          showToast('Game not found or expired. Returning to setup.', 'info', 2500);
           missingSessionNotified.current = true;
         }
         resetMissingSessionState();
         return;
       }
 
-      if (!missingSessionNotified.current) {
-        showToast('Game not found or expired. Returning to setup.', 'info', 2500);
-        missingSessionNotified.current = true;
+      missingSessionNotified.current = false;
+      resetWaitingLobbyReadTracking();
+      activeGameMissCountRef.current = 0;
+      if (
+        typeof expectedBackendMinLedgerRef.current === 'number'
+        && typeof ledger === 'number'
+        && Number.isFinite(ledger)
+        && ledger >= expectedBackendMinLedgerRef.current
+      ) {
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][sync] Backend caught up to expected ledger', {
+            sessionId,
+            ledger,
+            expectedMinLedger: expectedBackendMinLedgerRef.current,
+            reason,
+          });
+        }
+        resetActiveGameReadTracking();
       }
-      resetMissingSessionState();
-      return;
-    }
+      mergePingEvents(events);
 
-    missingSessionNotified.current = false;
-    mergePingEvents(events);
+      const backendLedger = typeof ledger === 'number' && Number.isFinite(ledger) ? ledger : null;
+      const lastAppliedLedger = lastAppliedBackendLedgerRef.current;
+      const currentTurn = typeof game.current_turn === 'number' ? game.current_turn : null;
+      const whoseTurn = typeof game.whose_turn === 'number' ? game.whose_turn : null;
+      const lastAppliedTurn = lastAppliedGameTurnRef.current;
+      const lastAppliedWhoseTurn = lastAppliedWhoseTurnRef.current;
 
-    const previousPhase = gamePhaseRef.current;
-    const newPhase = derivePhase(game);
-
-    setGameState(game);
-    if (newPhase === 'game_over' && previousPhase !== 'game_over') {
-      setShowGameOverModal(true);
-      if (game.winner === userAddress) {
-        void sound.playVictory();
-      } else {
-        void sound.playDefeat();
+      const isOlderLedger = (
+        backendLedger !== null
+        && typeof lastAppliedLedger === 'number'
+        && backendLedger < lastAppliedLedger
+      );
+      const isSameLedgerOlderTurn = (
+        backendLedger !== null
+        && typeof lastAppliedLedger === 'number'
+        && backendLedger === lastAppliedLedger
+        && currentTurn !== null
+        && typeof lastAppliedTurn === 'number'
+        && (
+          currentTurn < lastAppliedTurn
+          || (
+            currentTurn === lastAppliedTurn
+            && whoseTurn !== null
+            && typeof lastAppliedWhoseTurn === 'number'
+            && whoseTurn !== lastAppliedWhoseTurn
+          )
+        )
+      );
+      if (isOlderLedger || isSameLedgerOlderTurn) {
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][sync] Ignoring stale backend snapshot', {
+            sessionId,
+            reason,
+            backendLedger,
+            lastAppliedLedger,
+            currentTurn,
+            lastAppliedTurn,
+            whoseTurn,
+            lastAppliedWhoseTurn,
+          });
+        }
+        return;
       }
-    }
-    if (newPhase === 'my_turn' && previousPhase !== 'my_turn') {
-      void sound.playMyTurn();
-    }
-    setGamePhase(newPhase);
 
-    if (reason === 'post-ping' && newPhase === 'my_turn') {
-      setStatusMessage(null);
+      const previousPhase = gamePhaseRef.current;
+      const newPhase = derivePhase(game);
+      if (DEAD_DROP_DEBUG && newPhase !== previousPhase) {
+        console.info('[DeadDropUI][sync] Applying synced game phase', {
+          sessionId,
+          reason,
+          previousPhase,
+          newPhase,
+          ledger,
+          expectedMinLedger: expectedBackendMinLedgerRef.current,
+        });
+      }
+
+      // Batch state updates to prevent double-rendering
+      startTransition(() => {
+        setGameState(game);
+        setGamePhase(newPhase);
+      });
+      if (backendLedger !== null) {
+        lastAppliedBackendLedgerRef.current = Math.max(
+          lastAppliedBackendLedgerRef.current ?? 0,
+          backendLedger,
+        );
+      }
+      if (currentTurn !== null) {
+        lastAppliedGameTurnRef.current = currentTurn;
+      }
+      if (whoseTurn !== null) {
+        lastAppliedWhoseTurnRef.current = whoseTurn;
+      }
+
+      // Handle side effects AFTER state updates
+      if (newPhase === 'game_over' && previousPhase !== 'game_over') {
+        setShowGameOverModal(true);
+        if (game.winner === userAddress) {
+          void sound.playVictory();
+        } else {
+          void sound.playDefeat();
+        }
+      }
+      if (newPhase === 'my_turn' && previousPhase !== 'my_turn') {
+        void sound.playMyTurn();
+      }
+
+      if (reason === 'post-ping' && newPhase === 'my_turn') {
+        // Delay clearing to allow overlay exit animation to complete
+        setTimeout(() => {
+          setStatusMessage(null);
+        }, 300);
+      }
+    } catch (err) {
+      console.error('[DeadDropGame] syncFromChain error:', err);
+      showToast('Failed to sync game state. Retrying...', 'error');
+    } finally {
+      pollInFlightRef.current = false;
     }
-  }, [sessionId, derivePhase, userAddress, mergePingEvents, resetMissingSessionState, sound]);
+  }, [sessionId, derivePhase, userAddress, mergePingEvents, resetMissingSessionState, sound, armWaitingLobbyReadGrace, resetWaitingLobbyReadTracking, resetActiveGameReadTracking]);
 
   useEffect(() => {
     gamePhaseRef.current = gamePhase;
@@ -369,31 +593,79 @@ export function DeadDropGame({
 
   useEffect(() => {
     if (gamePhase === 'create') return;
+
+    // Initial sync
     void syncFromChain('phase-change');
 
+    // MIGRATED: Increased polling interval to match backend (5s)
+    // Backend caches for 2s and polls RPC every 5s, so frontend gets fresh data every poll
     const interval = setInterval(() => {
+      // Skip if previous poll still running
+      if (pollInFlightRef.current) {
+        if (DEAD_DROP_DEBUG) {
+          console.debug('[DeadDropGame] Skipping poll - previous still in flight');
+        }
+        return;
+      }
       void syncFromChain('poll');
-    }, 2500);
+    }, 5000); // Changed from 2500ms to 5000ms
 
     return () => clearInterval(interval);
   }, [gamePhase, sessionId, syncFromChain]);
 
   useEffect(() => {
     missingSessionNotified.current = false;
+    resetWaitingLobbyReadTracking();
     setStatusMessage(null);
-  }, [sessionId]);
+  }, [sessionId, resetWaitingLobbyReadTracking]);
 
   useEffect(() => {
     if (gamePhase === 'create') return;
+    if (gamePhase === 'waiting_opponent') {
+      armWaitingLobbyReadGrace();
+      activeGameMissCountRef.current = 0;
+      return;
+    }
+    resetWaitingLobbyReadTracking();
+  }, [gamePhase, armWaitingLobbyReadGrace, resetWaitingLobbyReadTracking]);
+
+  useEffect(() => {
+    if (gamePhase === 'create') return;
+    if (gamePhase === 'waiting_opponent') {
+      const currentRoomCode = sessionId.toString();
+      actionLock.current = false;
+      missingSessionNotified.current = false;
+      resetWaitingLobbyReadTracking();
+      resetActiveGameReadTracking();
+      setStatusMessage(null);
+      setGamePhase('create');
+      setJoinRoomCode(currentRoomCode);
+      setGameState(null);
+      setLoading(false);
+      setCopied(false);
+      showToast('Switched wallet. Room code is ready to join.', 'info', 1800);
+      return;
+    }
+    // If in an active/completed game phase, preserve session ID and let syncFromChain verify
+    if (gamePhase === 'my_turn' || gamePhase === 'opponent_turn' || gamePhase === 'game_over') {
+      // Don't reset immediately - syncFromChain will verify if user is still a player
+      // If not, it will naturally reset via the "game not found" path
+      return;
+    }
+
+    // For other edge cases, check if user is currently a player
     if (gameState && (gameState.player1 === userAddress || gameState.player2 === userAddress)) {
       return;
     }
 
+    // Only reset when truly switching to a non-participating wallet
     actionLock.current = false;
     missingSessionNotified.current = false;
+    resetWaitingLobbyReadTracking();
+    resetActiveGameReadTracking();
     setStatusMessage(null);
     setGamePhase('create');
-    setSessionId(createRandomSessionId());
+    setSessionId(createRandomSessionId()); // Only create new session here
     setGameState(null);
     setPingHistory([]);
     setExpandedProofTurn(null);
@@ -409,59 +681,181 @@ export function DeadDropGame({
 
   const handleOpenGame = async () => {
     await runAction(async () => {
+      const mutationKey = `open_game:${userAddress}:${sessionId}`;
+      if (DEAD_DROP_DEBUG) {
+        console.info('[DeadDropUI][open_game] Click received', {
+          sessionId,
+          userAddress,
+          mutationKey,
+          loading,
+        });
+      }
+      if (!tryBeginMutation(mutationKey)) {
+        if (DEAD_DROP_DEBUG) {
+          console.warn('[DeadDropUI][open_game] Deduped duplicate attempt', { mutationKey, sessionId, userAddress });
+        }
+        showToast('Open Lobby is already in progress for this room code.', 'info', 1500);
+        return;
+      }
       try {
         setLoading(true);
+        setStatusMessage(null);
         showToast('Opening lobby...', 'info');
 
         const hostPoints = parsePoints(DEFAULT_POINTS);
         if (!hostPoints || hostPoints <= 0n) throw new Error('Enter valid points');
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][open_game] Parsed host points', {
+            sessionId,
+            hostPoints: hostPoints.toString(),
+          });
+        }
 
-        const signer = getContractSigner({
-          preferSessionSigner: true,
-          sessionContractId: DEAD_DROP_CONTRACT,
-          sessionPhase: 'setup',
-          sessionId,
-        });
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][open_game] Building contract signer', {
+            sessionId,
+          });
+        }
+        const signer = getContractSigner();
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][open_game] Submitting open_game', { sessionId, userAddress });
+        }
         await deadDropService.openGame(sessionId, userAddress, hostPoints, signer);
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][open_game] open_game succeeded', { sessionId, userAddress });
+        }
 
+        armWaitingLobbyReadGrace();
+        resetActiveGameReadTracking();
+        setStatusMessage(null);
         setGamePhase('waiting_opponent');
         sound.playLobbyOpened();
         sound.startAmbient();
         onStandingsRefresh();
       } catch (err: unknown) {
-        showToast(toErrorMessage(err, 'Failed to open lobby'), 'error');
+        if (DEAD_DROP_DEBUG) {
+          console.error('[DeadDropUI][open_game] open_game failed before reconciliation', {
+            sessionId,
+            userAddress,
+            error: err,
+            message: toErrorMessage(err, 'Failed to open lobby'),
+          });
+        }
+        // If submission succeeded but the client lost track (timeout/retry/race), reconcile from chain.
+        const [lobby, game] = await Promise.all([
+          deadDropService.getLobby(sessionId).catch(() => null),
+          deadDropService.getGame(sessionId).catch(() => null),
+        ]);
+        const lobbyOwnedByUser = lobby?.host === userAddress;
+        const gameOwnedByUser = Boolean(game && (game.player1 === userAddress || game.player2 === userAddress));
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][open_game] Reconciliation result', {
+            sessionId,
+            lobbyFound: Boolean(lobby),
+            lobbyOwnedByUser,
+            gameFound: Boolean(game),
+            gameOwnedByUser,
+          });
+        }
+
+        if (lobbyOwnedByUser || gameOwnedByUser) {
+          if (!game) armWaitingLobbyReadGrace();
+          setStatusMessage(null);
+          setGameState(game ?? null);
+          setGamePhase(game ? derivePhase(game) : 'waiting_opponent');
+          sound.playLobbyOpened();
+          sound.startAmbient();
+          onStandingsRefresh();
+          showToast('Lobby is already open for this room code.', 'info', 2000);
+        } else {
+          showToast(toErrorMessage(err, 'Failed to open lobby'), 'error');
+        }
       } finally {
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][open_game] Finalizing mutation', { mutationKey, sessionId });
+        }
+        setStatusMessage(null);
         setLoading(false);
+        endMutation(mutationKey);
       }
     });
   };
 
   const handleJoinGame = async () => {
     await runAction(async () => {
+      const roomCode = parseInt(joinRoomCode.trim(), 10);
+      const mutationKey = `join_game:${userAddress}:${Number.isFinite(roomCode) ? roomCode : 'invalid'}`;
+      if (DEAD_DROP_DEBUG) {
+        console.info('[DeadDropUI][join_game] Click received', {
+          roomCodeInput: joinRoomCode,
+          parsedRoomCode: roomCode,
+          userAddress,
+          mutationKey,
+          loading,
+        });
+      }
+      if (!tryBeginMutation(mutationKey)) {
+        if (DEAD_DROP_DEBUG) {
+          console.warn('[DeadDropUI][join_game] Deduped duplicate attempt', { mutationKey, roomCode, userAddress });
+        }
+        showToast('Join Game is already in progress for this room code.', 'info', 1500);
+        return;
+      }
       try {
         setLoading(true);
+        setStatusMessage(null);
         showToast('Joining lobby...', 'info');
 
-        const roomCode = parseInt(joinRoomCode.trim(), 10);
         if (isNaN(roomCode) || roomCode <= 0) throw new Error('Enter a valid room code');
 
         const joinerPoints = parsePoints(DEFAULT_POINTS);
         if (!joinerPoints || joinerPoints <= 0n) throw new Error('Enter valid points');
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][join_game] Parsed joiner points', {
+            roomCode,
+            joinerPoints: joinerPoints.toString(),
+          });
+        }
         if (!DEAD_DROP_PROVER_URL) {
           throw new Error('Dead Drop prover URL is not configured');
         }
 
         const lobby = await deadDropService.getLobby(roomCode);
         if (!lobby) throw new Error('Lobby not found or expired');
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][join_game] Lobby fetched', {
+            roomCode,
+            host: lobby.host,
+            host_points: String(lobby.host_points),
+            created_ledger: lobby.created_ledger,
+          });
+        }
 
         const randomness = await getSessionRandomness(DEAD_DROP_PROVER_URL, roomCode);
-        const signer = getContractSigner({
-          preferSessionSigner: true,
-          sessionContractId: DEAD_DROP_CONTRACT,
-          sessionPhase: 'setup',
-          sessionId: roomCode,
-        });
-        await deadDropService.joinGame(
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][join_game] Randomness artifacts ready', {
+            roomCode,
+            randomnessOutputHexLength: randomness.randomnessOutputHex.length,
+            dropCommitmentHexLength: randomness.dropCommitmentHex.length,
+            randomnessSignatureHexLength: randomness.randomnessSignatureHex.length,
+            randomnessOutputHex: randomness.randomnessOutputHex,
+            dropCommitmentHex: randomness.dropCommitmentHex,
+            randomnessSignatureHex: randomness.randomnessSignatureHex,
+          });
+        }
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][join_game] Building contract signer', {
+            roomCode,
+          });
+        }
+        const signer = getContractSigner();
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][join_game] Submitting join_game', {
+            roomCode,
+            userAddress,
+          });
+        }
+        const joinTx = await deadDropService.joinGame(
           roomCode,
           userAddress,
           joinerPoints,
@@ -472,18 +866,106 @@ export function DeadDropGame({
           },
           signer,
         );
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][join_game] join_game succeeded', { roomCode, userAddress });
+        }
 
         setSessionId(roomCode);
-        const game = await deadDropService.getGame(roomCode);
-        setGameState(game);
-        setGamePhase(derivePhase(game));
+        const joinLedger = Number((joinTx as any)?.getTransactionResponse?.ledger);
+        armActiveGameReadGrace(Number.isFinite(joinLedger) ? joinLedger : undefined);
+        const game = await deadDropService.getGameWithConsistencyRetry(roomCode, {
+          expectedMinLedger: Number.isFinite(joinLedger) ? joinLedger : undefined,
+        });
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][join_game] Post-join game fetched', {
+            roomCode,
+            gameFound: Boolean(game),
+            player1: game?.player1,
+            player2: game?.player2,
+            status: game?.status,
+            current_turn: game?.current_turn,
+          });
+        }
+        setSessionId(roomCode);
+        if (game) {
+          const nextPhase = derivePhase(game);
+          if (DEAD_DROP_DEBUG) {
+            console.info('[DeadDropUI][join_game] Applying post-join phase', {
+              roomCode,
+              nextPhase,
+              joinLedger: Number.isFinite(joinLedger) ? joinLedger : null,
+            });
+          }
+          setGameState(game);
+          setGamePhase(nextPhase);
+          if (Number.isFinite(joinLedger)) {
+            lastAppliedBackendLedgerRef.current = Math.max(
+              lastAppliedBackendLedgerRef.current ?? 0,
+              joinLedger,
+            );
+          }
+          lastAppliedGameTurnRef.current = game.current_turn;
+          lastAppliedWhoseTurnRef.current = game.whose_turn;
+          setStatusMessage(null);
+        } else {
+          // Join succeeded on-chain but RPC reads are still catching up.
+          // Keep polling in a non-create phase so the game view can materialize automatically.
+          setGameState(null);
+          setGamePhase('waiting_opponent');
+          setStatusMessage('Join succeeded. Syncing game state...');
+          showToast('Join succeeded. Waiting for RPC sync...', 'info', 2000);
+        }
         sound.playOpponentJoined();
         sound.startAmbient();
         onStandingsRefresh();
       } catch (err: unknown) {
-        showToast(toErrorMessage(err, 'Failed to join game'), 'error');
+        if (DEAD_DROP_DEBUG) {
+          console.error('[DeadDropUI][join_game] join_game failed before reconciliation', {
+            parsedRoomCode: Number.isFinite(roomCode) ? roomCode : null,
+            userAddress,
+            error: err,
+            message: toErrorMessage(err, 'Failed to join game'),
+          });
+        }
+        const reconciledRoomCode = parseInt(joinRoomCode.trim(), 10);
+        const game = Number.isInteger(reconciledRoomCode) && reconciledRoomCode > 0
+          ? await deadDropService.getGameWithConsistencyRetry(reconciledRoomCode).catch(() => null)
+          : null;
+        const gameOwnedByUser = Boolean(game && (game.player1 === userAddress || game.player2 === userAddress));
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][join_game] Reconciliation result', {
+            roomCode: reconciledRoomCode,
+            gameFound: Boolean(game),
+            gameOwnedByUser,
+            player1: game?.player1,
+            player2: game?.player2,
+            status: game?.status,
+          });
+        }
+
+        if (gameOwnedByUser && Number.isInteger(reconciledRoomCode) && reconciledRoomCode > 0) {
+          const ownedGame = game!;
+          armActiveGameReadGrace();
+          setSessionId(reconciledRoomCode);
+          setGameState(ownedGame);
+          setGamePhase(derivePhase(ownedGame));
+          lastAppliedGameTurnRef.current = ownedGame.current_turn;
+          lastAppliedWhoseTurnRef.current = ownedGame.whose_turn;
+          setStatusMessage(null);
+          sound.playOpponentJoined();
+          sound.startAmbient();
+          onStandingsRefresh();
+          showToast('Game already started for this room code.', 'info', 2000);
+        } else {
+          showToast(toErrorMessage(err, 'Failed to join game'), 'error');
+        }
       } finally {
+        if (DEAD_DROP_DEBUG) {
+          console.info('[DeadDropUI][join_game] Finalizing mutation', { mutationKey, roomCode, userAddress });
+        }
+        setStatusMessage(null);
         setLoading(false);
+        endMutation(mutationKey);
       }
     });
   };
@@ -495,43 +977,96 @@ export function DeadDropGame({
       try {
         setLoading(true);
         setStatusMessage('Generating proof...');
-
-        const onChainGame = await deadDropService.getGame(sessionId);
-        if (!onChainGame) {
-          throw new Error('Game not found or expired. Reload and try again.');
-        }
-        if (onChainGame.player1 !== userAddress && onChainGame.player2 !== userAddress) {
-          throw new Error('You are not a player in this game.');
-        }
         if (!DEAD_DROP_PROVER_URL) {
           throw new Error('Dead Drop prover URL is not configured');
         }
 
-        const submittedTurn = onChainGame.current_turn;
-        const proof = await provePingViaBackend(DEAD_DROP_PROVER_URL, {
-          sessionId,
-          turn: submittedTurn,
-          pingX: selectedCell.x,
-          pingY: selectedCell.y,
-        });
+        let submitResult: Awaited<ReturnType<typeof deadDropService.submitPing>> | null = null;
+        let submittedTurn = 0;
+        let proof!: Awaited<ReturnType<typeof provePingViaBackend>>;
 
-        const signer = getContractSigner({
-          preferSessionSigner: true,
-          sessionContractId: DEAD_DROP_CONTRACT,
-          sessionPhase: 'gameplay',
-          sessionId,
-        });
-        const submitResult = await deadDropService.submitPing(
-          sessionId,
-          userAddress,
-          submittedTurn,
-          proof.distance,
-          selectedCell.x,
-          selectedCell.y,
-          Buffer.from(proof.proofHex, 'hex'),
-          proof.publicInputsHex.map((h) => Buffer.from(h, 'hex')),
-          signer,
-        );
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+          const onChainGame = await deadDropService.getGame(sessionId);
+          if (!onChainGame) {
+            throw new Error('Game not found or expired. Reload and try again.');
+          }
+          if (onChainGame.player1 !== userAddress && onChainGame.player2 !== userAddress) {
+            throw new Error('You are not a player in this game.');
+          }
+
+          const randomness = await getSessionRandomness(DEAD_DROP_PROVER_URL, sessionId);
+          const onChainCommitmentHex = Buffer.from(onChainGame.drop_commitment).toString('hex').toLowerCase();
+          if (randomness.dropCommitmentHex.toLowerCase() !== onChainCommitmentHex) {
+            throw new Error(
+              'Prover backend was restarted and lost this session randomness. Start a new lobby/game.'
+            );
+          }
+
+          submittedTurn = onChainGame.current_turn;
+          proof = await provePingViaBackend(DEAD_DROP_PROVER_URL, {
+            sessionId,
+            turn: submittedTurn,
+            pingX: selectedCell.x,
+            pingY: selectedCell.y,
+          });
+
+          const preSubmitGame = await deadDropService.getGame(sessionId);
+          const turnChanged = !preSubmitGame || preSubmitGame.current_turn !== submittedTurn;
+          const iAmStillPlayer = Boolean(preSubmitGame && (preSubmitGame.player1 === userAddress || preSubmitGame.player2 === userAddress));
+          const stillMyTurn = Boolean(
+            preSubmitGame
+              && ((preSubmitGame.whose_turn === 1 && preSubmitGame.player1 === userAddress)
+              || (preSubmitGame.whose_turn === 2 && preSubmitGame.player2 === userAddress))
+          );
+          if (turnChanged || !iAmStillPlayer || !stillMyTurn) {
+            await syncFromChain('pre-submit-turn-changed');
+            if (attempt < 2) {
+              if (DEAD_DROP_DEBUG) {
+                console.info('[DeadDropUI][submit_ping] Turn changed before submit, regenerating once', {
+                  sessionId,
+                  attempt,
+                  submittedTurn,
+                  latestTurn: preSubmitGame?.current_turn,
+                  stillMyTurn,
+                });
+              }
+              continue;
+            }
+            throw new Error('Turn changed while proof was generating. Game state re-synced.');
+          }
+
+          const signer = getContractSigner();
+          try {
+            submitResult = await deadDropService.submitPing(
+              sessionId,
+              userAddress,
+              submittedTurn,
+              proof.distance,
+              selectedCell.x,
+              selectedCell.y,
+              Buffer.from(proof.proofHex, 'hex'),
+              proof.publicInputsHex.map((h) => Buffer.from(h, 'hex')),
+              signer,
+            );
+            break;
+          } catch (err) {
+            if (err instanceof DeadDropServiceError && err.kind === 'invalid_public_inputs' && attempt < 2) {
+              if (DEAD_DROP_DEBUG) {
+                console.warn('[DeadDropUI][submit_ping] InvalidPublicInputs, retrying once after sync', {
+                  sessionId,
+                  attempt,
+                });
+              }
+              await syncFromChain('invalid-public-inputs-retry');
+              continue;
+            }
+            throw err;
+          }
+        }
+
+        if (!submitResult) {
+          throw new Error('Ping submission did not complete.');
+        }
 
         const zone = distanceToZone(proof.distance);
         const proofHashShort = shortHash(proof.proofHex);
@@ -587,15 +1122,35 @@ export function DeadDropGame({
         setSelectedCell(null);
         showToast(proof.distance === 0 ? 'DROP FOUND!' : `${zoneLabel(zone)} (${proof.distance}m)`, 'info', 2500);
 
-        const updatedGame = await deadDropService.getGame(sessionId);
+        const submitLedger = Number(submitResult.ledger);
+        armActiveGameReadGrace(Number.isFinite(submitLedger) ? submitLedger : undefined);
+        const updatedGame = await deadDropService.getGameWithConsistencyRetry(sessionId, {
+          expectedMinLedger: Number.isFinite(submitLedger) ? submitLedger : undefined,
+        });
         setGameState(updatedGame);
         const newPhase = derivePhase(updatedGame);
         setGamePhase(newPhase);
+        if (Number.isFinite(submitLedger)) {
+          lastAppliedBackendLedgerRef.current = Math.max(
+            lastAppliedBackendLedgerRef.current ?? 0,
+            submitLedger,
+          );
+        }
+        if (updatedGame) {
+          lastAppliedGameTurnRef.current = updatedGame.current_turn;
+          lastAppliedWhoseTurnRef.current = updatedGame.whose_turn;
+        }
         if (newPhase === 'game_over') {
           setShowGameOverModal(true);
         }
       } catch (err: unknown) {
-        showToast(toErrorMessage(err, 'Failed to submit ping'), 'error');
+        if (err instanceof DeadDropServiceError && err.kind === 'proof_verification_failed') {
+          showToast('Proof verifier rejected the proof. Check prover/verifier compatibility.', 'error');
+        } else if (err instanceof DeadDropServiceError && err.kind === 'invalid_public_inputs') {
+          showToast('Turn changed while proof was generating. Re-synced game state.', 'error');
+        } else {
+          showToast(toErrorMessage(err, 'Failed to submit ping'), 'error');
+        }
       } finally {
         setStatusMessage(null);
         setLoading(false);
@@ -607,13 +1162,9 @@ export function DeadDropGame({
     await runAction(async () => {
       try {
         setLoading(true);
-        const signer = getContractSigner({
-          preferSessionSigner: true,
-          sessionContractId: DEAD_DROP_CONTRACT,
-          sessionPhase: 'gameplay',
-          sessionId,
-        });
+        const signer = getContractSigner();
         await deadDropService.forceTimeout(sessionId, userAddress, signer);
+        armActiveGameReadGrace();
         showToast('Timeout claimed', 'success');
         sound.playTimeout();
         const game = await deadDropService.getGame(sessionId);
@@ -630,12 +1181,13 @@ export function DeadDropGame({
   };
 
   const handleStartNewGame = () => {
-    releaseDeadDropSessionSigner();
     if (gameState?.winner) onGameComplete();
     sound.stopAmbient();
 
     actionLock.current = false;
     missingSessionNotified.current = false;
+    resetWaitingLobbyReadTracking();
+    resetActiveGameReadTracking();
 
     setStatusMessage(null);
     setGamePhase('create');
@@ -651,11 +1203,6 @@ export function DeadDropGame({
     setShowGameOverModal(false);
   };
 
-  useEffect(() => {
-    if (gamePhase !== 'game_over') return;
-    releaseDeadDropSessionSigner();
-  }, [gamePhase, releaseDeadDropSessionSigner]);
-
   const copyToClipboard = async (text: string) => {
     await navigator.clipboard.writeText(text);
     setCopied(true);
@@ -669,6 +1216,12 @@ export function DeadDropGame({
   };
 
   useEffect(() => {
+    // Skip if ping count hasn't changed (e.g., just proof updates)
+    if (pingHistory.length === lastPingCountRef.current) {
+      return;
+    }
+    lastPingCountRef.current = pingHistory.length;
+
     const now = Date.now();
     const txHashesToHydrate = Array.from(
       new Set(
@@ -685,6 +1238,8 @@ export function DeadDropGame({
       )
     );
     if (txHashesToHydrate.length === 0) return;
+
+    const abortController = new AbortController();
 
     for (const txHash of txHashesToHydrate) {
       if (proofHydrationInFlightRef.current.has(txHash)) continue;
@@ -714,9 +1269,11 @@ export function DeadDropGame({
       });
 
       void (async () => {
+        if (abortController.signal.aborted) return;
+
         try {
           const decoded = await deadDropService.getSubmitPingProofFromTx(txHash);
-          if (unmountedRef.current) return;
+          if (abortController.signal.aborted || unmountedRef.current) return;
 
           if (!decoded) {
             setPingHistory((prev) => {
@@ -752,7 +1309,7 @@ export function DeadDropGame({
           const publicInputsHex = decoded.publicInputsHex.map(normalizeHex);
           const proofHashShort = shortHash(proofHex);
           const publicInputsHashShort = shortHash(await digestPublicInputsHex(publicInputsHex));
-          if (unmountedRef.current) return;
+          if (abortController.signal.aborted || unmountedRef.current) return;
 
           setPingHistory((prev) => {
             let changed = false;
@@ -779,14 +1336,30 @@ export function DeadDropGame({
             return changed ? next : prev;
           });
         } finally {
-          proofHydrationInFlightRef.current.delete(txHash);
+          if (!abortController.signal.aborted) {
+            proofHydrationInFlightRef.current.delete(txHash);
+          }
         }
       })();
     }
+
+    return () => {
+      abortController.abort();
+    };
   }, [pingHistory]);
 
   useEffect(() => {
     const LOADING_TIMEOUT_MS = 20_000;
+
+    // Only run interval if there are actually loading proofs
+    const hasLoadingProofs = pingHistory.some(
+      ping => ping.proof.decodeStatus === 'loading'
+    );
+
+    if (!hasLoadingProofs) {
+      return; // No cleanup needed, no interval created
+    }
+
     const interval = setInterval(() => {
       const now = Date.now();
       setPingHistory((prev) => {
@@ -822,7 +1395,7 @@ export function DeadDropGame({
     }, 2_000);
 
     return () => clearInterval(interval);
-  }, []);
+  }, [pingHistory]);
 
   const historyEntries = useMemo(() => [...pingHistory].reverse(), [pingHistory]);
   const historyTotalPages = Math.max(1, Math.ceil(historyEntries.length / MODAL_PAGE_SIZE));

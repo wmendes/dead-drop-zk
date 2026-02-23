@@ -4,6 +4,8 @@ const { WebSocketServer } = require("ws");
 const { Keypair, TransactionBuilder, BASE_FEE, Networks, Operation, xdr } = require("@stellar/stellar-sdk");
 const { provePing, computeDropCommitment } = require("./prover");
 const { submitSorobanViaRelayer, getRpcServer, normalizeBase64, tryExtractHostFunction } = require("./relayer");
+const { EventIndexer } = require("./eventIndexer");
+const { GameStateService } = require("./gameStateService");
 
 const PING_GRID_SIZE = 100;
 const RELAY_TTL_MS = Number(process.env.DEAD_DROP_RELAY_TTL_MS || 120_000);
@@ -21,14 +23,37 @@ function corsHeaders() {
 }
 
 function sendJson(res, status, body) {
+  const payload = JSON.stringify(body, (_key, value) =>
+    typeof value === "bigint" ? value.toString() : value
+  );
+  if (res.headersSent) {
+    if (!res.writableEnded) {
+      try {
+        res.end(payload);
+      } catch {
+        // ignore secondary write errors
+      }
+    }
+    return;
+  }
   res.writeHead(status, {
     ...corsHeaders(),
     "content-type": "application/json",
   });
-  res.end(JSON.stringify(body));
+  res.end(payload);
 }
 
 function sendError(res, status, message) {
+  if (res.headersSent) {
+    if (!res.writableEnded) {
+      try {
+        res.end();
+      } catch {
+        // ignore
+      }
+    }
+    return;
+  }
   sendJson(res, status, { error: message });
 }
 
@@ -72,6 +97,38 @@ function parseU32(value, label) {
     throw new Error(`${label} must be uint32`);
   }
   return n;
+}
+
+function extractSessionIdFromHostFunctionXdr(funcXdrBase64) {
+  try {
+    if (typeof funcXdrBase64 !== "string" || !funcXdrBase64) return null;
+    const normalized = normalizeBase64(funcXdrBase64, "func_xdr");
+    const hostFnXdr = tryExtractHostFunction(normalized, "func_xdr");
+    const hostFn = xdr.HostFunction.fromXDR(hostFnXdr, "base64");
+    if (hostFn.switch().name !== "hostFunctionTypeInvokeContract") return null;
+
+    const invoke = hostFn.invokeContract();
+    const args = invoke.args();
+    if (!Array.isArray(args) || args.length === 0) return null;
+
+    const first = args[0];
+    if (!first || typeof first.switch !== "function") return null;
+    if (first.switch().name !== "scvU32") return null;
+    return first.u32();
+  } catch {
+    return null;
+  }
+}
+
+function clearGameStateCacheForTxBody(body, gameStateService) {
+  if (!gameStateService) return;
+  const sessionId = extractSessionIdFromHostFunctionXdr(body?.func_xdr);
+  if (!Number.isInteger(sessionId)) return;
+  try {
+    gameStateService.clearCache(sessionId);
+  } catch (err) {
+    console.warn("[Server] Failed to clear game state cache for session %s: %s", sessionId, err instanceof Error ? err.message : String(err));
+  }
 }
 
 
@@ -204,6 +261,28 @@ function createServer(options = {}) {
     );
   }
 
+  // Initialize event indexer and game state service
+  const deadDropContractId = process.env.DEAD_DROP_CONTRACT_ID || process.env.VITE_DEAD_DROP_CONTRACT_ID;
+  const rpcUrl = process.env.SOROBAN_RPC_URL || process.env.VITE_SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
+
+  let eventIndexer = null;
+  let gameStateService = null;
+  if (deadDropContractId) {
+    eventIndexer = new EventIndexer(deadDropContractId, rpcUrl);
+    eventIndexer.start();
+    console.log('[dead-drop-prover] Event indexer started for contract:', deadDropContractId);
+
+    gameStateService = new GameStateService(eventIndexer, deadDropContractId, rpcUrl);
+    console.log('[dead-drop-prover] Game state service initialized');
+
+    // Prune game state cache every 60 seconds
+    setInterval(() => {
+      gameStateService.pruneCache();
+    }, 60000);
+  } else {
+    console.warn('[dead-drop-prover] DEAD_DROP_CONTRACT_ID not set, event indexing disabled');
+  }
+
   function getSessionPeers(sessionId) {
     let peers = webrtcPeersBySession.get(sessionId);
     if (!peers) {
@@ -333,9 +412,92 @@ function createServer(options = {}) {
 
     try {
       const result = await submitSorobanViaRelayer(body);
+      clearGameStateCacheForTxBody(body, gameStateService);
       sendJson(res, 200, result);
     } catch (err) {
       const message = err instanceof Error ? err.message : "relayer submission failed";
+      const shouldFallbackDirect =
+        typeof message === "string" &&
+        (
+          message.includes("SIMULATION_SIGNED_AUTH_VALIDATION_FAILED") ||
+          message.includes("Signed auth entry validation failed") ||
+          message.includes("InvalidAction")
+        );
+
+      if (shouldFallbackDirect) {
+        console.warn("[submit] Relayer auth validation failed; falling back to direct submission");
+        try {
+          const secret = process.env.BACKEND_SOURCE_SECRET;
+          if (!secret) {
+            sendError(res, 500, "BACKEND_SOURCE_SECRET not set");
+            return;
+          }
+
+          const rpcUrl = typeof body.rpc_url === "string" && body.rpc_url ? body.rpc_url : "(default)";
+          const authCount = Array.isArray(body.auth_entries_xdr) ? body.auth_entries_xdr.length : 0;
+          const funcLen = typeof body.func_xdr === "string" ? body.func_xdr.length : 0;
+          console.log("[submit-direct:fallback] rpc=%s auth_entries=%d func_xdr_len=%d", rpcUrl, authCount, funcLen);
+
+          const keypair = Keypair.fromSecret(secret);
+          const server = getRpcServer(body.rpc_url);
+          const account = await server.getAccount(keypair.publicKey());
+
+          const funcXdr = tryExtractHostFunction(normalizeBase64(body.func_xdr, "func_xdr"), "func_xdr");
+          const hostFn = xdr.HostFunction.fromXDR(funcXdr, "base64");
+          const authEntries = (body.auth_entries_xdr || []).map((e, i) =>
+            xdr.SorobanAuthorizationEntry.fromXDR(normalizeBase64(e, `auth[${i}]`), "base64")
+          );
+
+          const networkPassphrase = process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET;
+          const tx = new TransactionBuilder(account, {
+            fee: BASE_FEE,
+            networkPassphrase,
+          })
+            .addOperation(Operation.invokeHostFunction({ func: hostFn, auth: authEntries }))
+            .setTimeout(60)
+            .build();
+
+          const prepared = await server.prepareTransaction(tx);
+          prepared.sign(keypair);
+
+          const sendResult = await server.sendTransaction(prepared);
+          if (sendResult.status === "ERROR") {
+            const detail = sendResult.errorResult
+              ? sendResult.errorResult.toXDR("base64")
+              : JSON.stringify(sendResult);
+            sendError(res, 400, `Transaction submission failed: ${detail}`);
+            return;
+          }
+
+          let txResult;
+          for (let i = 0; i < 20; i++) {
+            await new Promise((r) => setTimeout(r, 2000));
+            txResult = await server.getTransaction(sendResult.hash);
+            if (txResult.status !== "NOT_FOUND") break;
+          }
+
+          const returnValueXdr = txResult?.returnValue
+            ? txResult.returnValue.toXDR("base64")
+            : null;
+
+          sendJson(res, 200, {
+            hash: sendResult.hash,
+            status: txResult?.status || "UNKNOWN",
+            ledger: txResult?.ledger ?? null,
+            return_value_xdr: returnValueXdr,
+            relayer_fallback: "direct",
+          });
+          clearGameStateCacheForTxBody(body, gameStateService);
+          return;
+        } catch (fallbackErr) {
+          const fallbackMessage = fallbackErr instanceof Error
+            ? fallbackErr.message
+            : "direct fallback submission failed";
+          sendError(res, 500, `${message} | direct_fallback_error=${fallbackMessage}`);
+          return;
+        }
+      }
+
       sendError(res, 500, message);
     }
   }
@@ -430,6 +592,7 @@ function createServer(options = {}) {
         : null;
 
       console.log("[submit-direct] done status=%s ledger=%s", txResult?.status, txResult?.ledger);
+      clearGameStateCacheForTxBody(body, gameStateService);
       sendJson(res, 200, {
         hash: sendResult.hash,
         status: txResult?.status || "UNKNOWN",
@@ -702,6 +865,69 @@ function createServer(options = {}) {
 
     if (req.method === "GET" && url.pathname === "/relay/ping/result") {
       await handleRelayPingResult(req, res, url);
+      return;
+    }
+
+    // GET /events/ping?session_id=123
+    if (req.method === "GET" && url.pathname === "/events/ping") {
+      const sessionIdParam = url.searchParams.get('session_id');
+      if (!sessionIdParam) {
+        sendError(res, 400, "session_id parameter required");
+        return;
+      }
+
+      let sessionId;
+      try {
+        sessionId = parseU32(sessionIdParam, "session_id");
+      } catch (err) {
+        sendError(res, 400, err.message);
+        return;
+      }
+
+      if (!eventIndexer) {
+        sendError(res, 503, "Event indexer not available");
+        return;
+      }
+
+      try {
+        const events = eventIndexer.getEvents(sessionId);
+        sendJson(res, 200, { events });
+      } catch (error) {
+        console.error('[Server] Event fetch error:', error);
+        sendError(res, 500, error.message || "Failed to fetch events");
+      }
+      return;
+    }
+
+    // GET /game/state?session_id=123
+    // Returns complete game state including contract data and indexed events
+    if (req.method === "GET" && url.pathname === "/game/state") {
+      const sessionIdParam = url.searchParams.get('session_id');
+      if (!sessionIdParam) {
+        sendError(res, 400, "session_id parameter required");
+        return;
+      }
+
+      let sessionId;
+      try {
+        sessionId = parseU32(sessionIdParam, "session_id");
+      } catch (err) {
+        sendError(res, 400, err.message);
+        return;
+      }
+
+      if (!gameStateService) {
+        sendError(res, 503, "Game state service not available");
+        return;
+      }
+
+      try {
+        const state = await gameStateService.getGameState(sessionId);
+        sendJson(res, 200, state);
+      } catch (error) {
+        console.error('[Server] Game state fetch error:', error);
+        sendError(res, 500, error.message || "Failed to fetch game state");
+      }
       return;
     }
 
