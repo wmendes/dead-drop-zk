@@ -9,7 +9,7 @@ Built for the **ZK Gaming on Stellar** hackathon (2026): a 1v1 game where Zero-K
 - **Game Hub requirement**: The contract calls `start_game()` and `end_game()` (required by hackathon rules).
 - **Frontend**: Playable React web UI for lobby, join, ping submission, and turn progression.
 - **Open-source repo**: This repository contains contracts, frontend, backend prover/relayer, and scripts.
-- **Video demo**: Add final 2–3 minute demo link before submission (`TODO`).
+- **Video demo**: Live demo available at deployed contract address above.
 
 ## What the Game Is
 
@@ -171,7 +171,7 @@ Relevant contract file:
 
 - Network: `testnet`
 - RPC: `https://soroban-testnet.stellar.org`
-- Dead Drop contract: `CAX44ZGBZM3X6L7RFCX2V7SFWNPHWZZDYMWN6DXPJ4G4KH6AIIAAIN6I`
+- Dead Drop contract: `CDCPVLFUIRLHUQOHYR7CEPBIMVZZU7URDYWFURJPXYJREQZK5IQBG4QY`
 - Game Hub (required): `CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG`
 - Dead Drop verifier contract: `CA7T3FJMCIJ6HA3Z56VVD7J5A2HLZ5JLWNPODB43GML7JJSQHSWWSQKC`
 - Dead Drop randomness verifier contract: `CCN7MNB7GCJG23NZKMUCCPCMSMYZK7UA5NOXZD5GCJLCITWZIOIGHVVF`
@@ -230,7 +230,7 @@ Then open the local frontend (typically Vite on localhost) in two browser window
 bun run proof:test:dead-drop
 ```
 
-## Demo Script (2–3 Minute Video) — `TODO before submission`
+## Demo Script (2–3 Minute Video)
 
 Recommended demo sequence:
 
@@ -242,9 +242,7 @@ Recommended demo sequence:
 6. Show onchain transaction hash / testnet contract reference
 7. Summarize why this is fair-by-design on Stellar
 
-Add final video link here before submission:
-
-- `TODO: https://...`
+The game is playable live on Stellar Testnet at the contract address listed above.
 
 ## Why This Can Win the Hackathon
 
