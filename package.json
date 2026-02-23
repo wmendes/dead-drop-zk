@@ -5,7 +5,6 @@
   "scripts": {
     "setup": "bun run scripts/setup.ts",
     "build": "bun run scripts/build.ts",
-    "build:proof": "cargo build --release -p dead-drop-proof-host --manifest-path=risc0/dead_drop_proof/Cargo.toml",
     "deploy": "bun run scripts/deploy.ts",
     "bindings": "bun run scripts/bindings.ts",
     "create": "bun run scripts/create.ts",
