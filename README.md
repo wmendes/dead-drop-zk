@@ -9,7 +9,7 @@ Built for the **ZK Gaming on Stellar** hackathon (2026): a 1v1 game where Zero-K
 - **Game Hub requirement**: The contract calls `start_game()` and `end_game()` (required by hackathon rules).
 - **Frontend**: Playable React web UI for lobby, join, ping submission, and turn progression.
 - **Open-source repo**: This repository contains contracts, frontend, backend prover/relayer, and scripts.
-- **Video demo**: Live demo available at deployed contract address above.
+- **Video demo**: https://youtu.be/oS6AeBsSws0
 
 ## What the Game Is
 
@@ -247,54 +247,6 @@ Then open the local frontend (typically Vite on localhost) in two browser window
 bun run proof:test:dead-drop
 ```
 
-## Demo Script (2–3 Minute Video)
-
-Recommended demo sequence:
-
-1. Explain the hidden-information problem (why ZK matters)
-2. Show `open_game` (host creates lobby / room code)
-3. Show `join_game` (opponent joins)
-4. Submit a ping and show distance result
-5. Explain proof generation + onchain verification path
-6. Show onchain transaction hash / testnet contract reference
-7. Summarize why this is fair-by-design on Stellar
-
-The game is playable live on Stellar Testnet at the contract address listed above.
-
-## Why This Can Win the Hackathon
-
-### 1. ZK is a real gameplay primitive
-
-Dead Drop uses ZK to enforce a mechanic players actually care about:
-
-- hidden information (drop location)
-- fair resolution (distance correctness)
-- verifiable outcomes onchain
-
-If you remove ZK, the game loses its trust model.
-
-### 2. The prototype is full-stack and playable
-
-- Soroban contract on testnet
-- verifier integration
-- frontend UI
-- backend prover + relayer path
-- multiplayer flow (lobby/join/turns)
-
-Judges can play it and see the ZK mechanic in action.
-
-### 3. Strong Stellar relevance
-
-- Built in the Stellar/Soroban ecosystem
-- Integrates Game Hub lifecycle (`start_game` / `end_game`)
-- Uses ZK-friendly primitives and a design aligned with the Protocol 25 / X-Ray direction (BN254/Poseidon-era ZK game mechanics on Stellar)
-
-## Known Limitations (Honest Prototype Notes)
-
-- Current default proof generation path is **backend-assisted** (`/prove/ping`) rather than fully in-browser proving.
-- Multiplayer sync is production-hardened for prototype use, but still relies on backend state/event aggregation for smooth UX.
-- Several ZK/RISC0-related folders in the repo are experimental/reference work and not the default Dead Drop runtime path.
-
 ## Submission Requirements Mapping
 
 1. **ZK-Powered Mechanic**  
@@ -309,8 +261,8 @@ Judges can play it and see the ZK mechanic in action.
 4. **Open-source Repo**  
    This repository.
 
-5. **Video Demo**  
-   `TODO` add final 2–3 minute demo URL before submission.
+5. **Video Demo**
+   https://youtu.be/oS6AeBsSws0
 
 ## Acknowledgements
 
