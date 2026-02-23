@@ -1,4 +1,6 @@
-# Groth16 Implementation - COMPLETE ✅
+# Dead Drop Architecture - Groth16 Zero-Knowledge Implementation
+
+> This document provides the complete technical architecture of Dead Drop's Groth16-based ZK proof system.
 
 ## Summary
 

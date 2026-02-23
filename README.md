@@ -184,11 +184,28 @@ Note: If you redeploy, update the README and frontend/runtime config before fina
 - `dead-drop-frontend/` — React/Vite game UI and transaction orchestration
 - `backend/dead-drop-prover/` — backend prover, relayer integration, event indexer, game-state API
 - `circuits/dead_drop/` — Noir circuit + Groth16 artifacts (`.zkey`, circuit JSON)
+- `noir-groth16-reference/` — Active Groth16 verifier infrastructure and Powers of Tau
 - `bindings/` — generated TS bindings for contracts
 - `scripts/` — build/deploy/bindings/dev workflows (Stellar Game Studio)
 - `deployment.json` — current testnet contract IDs and runtime metadata
-- `risc0/` — experimental/reference proof flow work (not the default Dead Drop runtime path)
-- `zk-circuits/` — additional circuit artifacts/reference assets (non-primary runtime path)
+- `docs/archive/` — historical development documentation
+
+### Contract Organization
+
+**Active Contracts (Deployed for Dead Drop):**
+- `contracts/dead-drop/` - Main game contract (lobby, gameplay, ZK verification)
+- `contracts/mock-game-hub/` - Required Game Hub integration for hackathon
+
+**Reference Templates (Stellar Game Studio Framework):**
+- `contracts/number-guess/` - Simple guessing game pattern
+- `contracts/dice-duel/` - Dice rolling with deterministic randomness
+- `contracts/twenty-one/` - Blackjack-style game
+
+Dead Drop was built using the Stellar Game Studio framework, which this repo is based on. The reference templates demonstrate the framework patterns but are not part of the Dead Drop game itself.
+
+**Proof System:**
+- `noir-groth16-reference/` - Active Groth16 verifier infrastructure and tooling
+- `circuits/dead_drop/` - Noir circuits and Groth16 artifacts for Dead Drop proofs
 
 ## Getting Started (Local Demo)
 
